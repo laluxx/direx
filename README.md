@@ -7,17 +7,17 @@ Navigation is keyboard-driven and file opening hands off to `$EDITOR`.
 
 ## What it looks like
 
-TODO Screenshot.
+![screenshot](etc/screenshot.png)
 
 ## Keys
 
-| Key                 | Action                 |
-|---------------------|------------------------|
-| `j` / `n` / `C-n`   | move down              |
-| `k` / `p` / `C-p`   | move up                |
-| `l` / `Enter`       | open directory or file |
-| `h`                 | go up a directory      |
-| `q` / `Esc` / `C-c` | quit                   |
+| Key             | Action                 |
+|-----------------|------------------------|
+| `j` `n`  `C-n`  | move down              |
+| `k` `p`  `C-p`  | move up                |
+| `l` `Enter`     | open directory or file |
+| `h`             | go up a directory      |
+| `q` `Esc` `C-c` | quit                   |
 
 Navigation wraps at both ends.
 

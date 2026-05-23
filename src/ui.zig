@@ -49,7 +49,8 @@ pub fn render(app_tui: *tui.Tui, browser: *Browser, config: *Config, full: bool)
             frame_count += 1;
             total_frame_time += @as(i64, @intCast(diff));
             var stats_buf: [128]u8 = undefined;
-            const stats_text = try std.fmt.bufPrint(&stats_buf, "Frame: {d}ns | Avg: {d}ns | Scroll: {d} | Char: {d} | Size: {d}x{d}", .{ diff, @divTrunc(total_frame_time, @as(i64, @intCast(frame_count))), browser.scroll_offset, browser.char_offset, size.w, size.h });
+            const mode_str = if (browser.is_editing) "INSERT" else "NORMAL";
+            const stats_text = try std.fmt.bufPrint(&stats_buf, "Frame: {d}ns | Avg: {d}ns | Mode: {s} | Scroll: {d} | Char: {d}", .{ diff, @divTrunc(total_frame_time, @as(i64, @intCast(frame_count))), mode_str, browser.scroll_offset, browser.char_offset });
             app_tui.writeString(0, size.h - 1, stats_text, .{ .fg = tui.Color.fromRgb(255, 255, 255), .bg = tui.Color.fromRgb(50, 50, 50) });
         }
     }
@@ -150,10 +151,12 @@ fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize
     x += 2;
 
     const name_style = if (entry.is_dir) tui.Style{ .fg = config.theme.directories } else tui.Style{ .fg = config.theme.default_fg };
+    const name_to_render = if (is_selected and browser.is_editing) browser.edit_buffer.items else entry.name;
+    const name_count = std.unicode.utf8CountCodepoints(name_to_render) catch 0;
+
     if (is_selected) {
-        var iter = (std.unicode.Utf8View.init(entry.name) catch unreachable).iterator();
+        var iter = (std.unicode.Utf8View.init(name_to_render) catch unreachable).iterator();
         var cur_cp_idx: usize = 0;
-        const name_count = std.unicode.utf8CountCodepoints(entry.name) catch 0;
         
         while (iter.nextCodepoint()) |cp| {
             if (cur_cp_idx == browser.char_offset) {
@@ -165,14 +168,14 @@ fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize
             cur_cp_idx += 1;
         }
         
-        // Handle cursor at the end (one past the last character)
+        // Handle cursor at the end
         if (browser.char_offset == name_count) {
             app_tui.setCell(x, y, ' ', .{ .reversed = true });
             x += 1;
         }
     } else {
-        app_tui.writeString(x, y, entry.name, name_style);
-        x += @as(u16, @intCast(try std.unicode.utf8CountCodepoints(entry.name)));
+        app_tui.writeString(x, y, name_to_render, name_style);
+        x += @as(u16, @intCast(name_count));
     }
     
     // Clear rest of line

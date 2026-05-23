@@ -36,6 +36,10 @@ pub const Browser = struct {
     allocator:      std.mem.Allocator,
     max_size_len:   usize = 1,
     
+    // Editing state
+    is_editing:     bool = false,
+    edit_buffer:    std.ArrayList(u8),
+
     // Path -> Selected Index history
     cursor_history: std.StringHashMap(usize),
     // Full Path -> Expanded state
@@ -47,6 +51,7 @@ pub const Browser = struct {
             .path = try allocator.dupe(u8, path),
             .entries = try std.ArrayList(FileEntry).initCapacity(allocator, 64),
             .allocator = allocator,
+            .edit_buffer = try std.ArrayList(u8).initCapacity(allocator, 64),
             .cursor_history = std.StringHashMap(usize).init(allocator),
             .expansion_history = std.StringHashMap(void).init(allocator),
         };
@@ -60,6 +65,7 @@ pub const Browser = struct {
             entry.deinit();
         }
         self.entries.deinit(self.allocator);
+        self.edit_buffer.deinit(self.allocator);
         
         var c_iter = self.cursor_history.iterator();
         while (c_iter.next()) |entry| {
@@ -85,11 +91,10 @@ pub const Browser = struct {
     pub fn refresh(self: *Browser, target_entry_name: ?[]const u8) !void {
         for (self.entries.items) |*entry| entry.deinit();
         self.entries.clearRetainingCapacity();
-        self.max_size_len = 1;
         self.prev_index = null;
         self.char_offset = 0;
 
-        var dir = try std.fs.cwd().openDir(self.path, .{ .iterate = true });
+        var dir = std.fs.cwd().openDir(self.path, .{ .iterate = true }) catch return;
         defer dir.close();
 
         var iter = dir.iterate();
@@ -130,19 +135,27 @@ pub const Browser = struct {
         }
 
         // Restore selection
-        if (self.cursor_history.get(self.path)) |idx| {
-            self.selected_index = if (idx < self.entries.items.len) idx else 0;
-        } else if (target_entry_name) |target| {
-            self.selected_index = 0;
+        var found_target = false;
+        if (target_entry_name) |target| {
             for (self.entries.items, 0..) |entry, idx| {
                 if (std.mem.eql(u8, entry.name, target)) {
                     self.selected_index = idx;
+                    found_target = true;
                     break;
                 }
             }
-        } else {
-            self.selected_index = 0;
         }
+
+        if (!found_target) {
+            if (self.cursor_history.get(self.path)) |idx| {
+                self.selected_index = if (idx < self.entries.items.len) idx else 0;
+            } else {
+                self.selected_index = 0;
+            }
+        }
+        
+        // Sync history immediately after refresh
+        try self.saveCurrentIndex();
     }
 
     pub fn saveCurrentIndex(self: *Browser) !void {
@@ -189,9 +202,17 @@ pub const Browser = struct {
     }
 
     fn sortEntries(_: void, a: FileEntry, b: FileEntry) bool {
-        if (a.level != b.level) return false;
-        if (a.is_dir != b.is_dir) return a.is_dir;
-        return std.mem.lessThan(u8, a.name, b.name);
+        // Emacs dired style: alphabetical, case-insensitive, ignore leading dots
+        const name_a = if (a.name.len > 0 and a.name[0] == '.') a.name[1..] else a.name;
+        const name_b = if (b.name.len > 0 and b.name[0] == '.') b.name[1..] else b.name;
+
+        const len = @min(name_a.len, name_b.len);
+        for (0..len) |i| {
+            const ca = std.ascii.toLower(name_a[i]);
+            const cb = std.ascii.toLower(name_b[i]);
+            if (ca != cb) return ca < cb;
+        }
+        return name_a.len < name_b.len;
     }
 
     pub fn moveUp(self: *Browser) void {
@@ -212,9 +233,9 @@ pub const Browser = struct {
 
     pub fn moveCharForward(self: *Browser) void {
         if (self.entries.items.len == 0) return;
-        const name = self.entries.items[self.selected_index].name;
+        const name = if (self.is_editing) self.edit_buffer.items else self.entries.items[self.selected_index].name;
         const count = std.unicode.utf8CountCodepoints(name) catch return;
-        if (self.char_offset < count) { // Allow offset up to count (the space after the name)
+        if (self.char_offset < count) {
             self.char_offset += 1;
         }
     }
@@ -231,9 +252,89 @@ pub const Browser = struct {
 
     pub fn moveLineEnd(self: *Browser) void {
         if (self.entries.items.len == 0) return;
-        const name = self.entries.items[self.selected_index].name;
+        const name = if (self.is_editing) self.edit_buffer.items else self.entries.items[self.selected_index].name;
         const count = std.unicode.utf8CountCodepoints(name) catch return;
         self.char_offset = count;
+    }
+
+    pub fn startEditing(self: *Browser) !void {
+        if (self.entries.items.len == 0) return;
+        self.is_editing = true;
+        self.edit_buffer.clearRetainingCapacity();
+        try self.edit_buffer.appendSlice(self.allocator, self.entries.items[self.selected_index].name);
+    }
+
+    pub fn stopEditing(self: *Browser, apply: bool) !void {
+        if (!self.is_editing) return;
+        if (apply) {
+            try self.renameSelected(self.edit_buffer.items);
+        }
+        self.is_editing = false;
+        self.edit_buffer.clearRetainingCapacity();
+    }
+
+    pub fn renameSelected(self: *Browser, new_name: []const u8) !void {
+        if (self.entries.items.len == 0) return;
+        const entry = &self.entries.items[self.selected_index];
+        if (std.mem.eql(u8, entry.name, new_name)) return;
+
+        const parent_path = std.fs.path.dirname(entry.full_path) orelse return;
+        const new_full_path = try std.fs.path.join(self.allocator, &.{ parent_path, new_name });
+        defer self.allocator.free(new_full_path);
+
+        try std.fs.renameAbsolute(entry.full_path, new_full_path);
+        
+        // Update history if it's an expanded directory
+        if (entry.is_dir and self.expansion_history.contains(entry.full_path)) {
+            if (self.expansion_history.fetchRemove(entry.full_path)) |old| {
+                self.allocator.free(old.key);
+            }
+            try self.expansion_history.put(try self.allocator.dupe(u8, new_full_path), {});
+        }
+
+        // We need to refresh to get updated stats and names
+        const target_name = try self.allocator.dupe(u8, new_name);
+        defer self.allocator.free(target_name);
+        try self.refresh(target_name);
+    }
+
+    pub fn deleteCharUnderCursor(self: *Browser) !void {
+        if (self.entries.items.len == 0) return;
+        if (!self.is_editing) try self.startEditing();
+        
+        var iter = (std.unicode.Utf8View.init(self.edit_buffer.items) catch return).iterator();
+        var i: usize = 0;
+        while (i < self.char_offset) : (i += 1) _ = iter.nextCodepoint();
+        
+        const start = iter.i;
+        if (iter.nextCodepoint()) |_| {
+            const end = iter.i;
+            self.edit_buffer.replaceRange(self.allocator, start, end - start, &.{}) catch {};
+        }
+    }
+
+    pub fn backspace(self: *Browser) !void {
+        if (self.entries.items.len == 0) return;
+        if (self.char_offset == 0) return;
+        if (!self.is_editing) try self.startEditing();
+
+        self.char_offset -= 1;
+        try self.deleteCharUnderCursor();
+    }
+
+    pub fn insertChar(self: *Browser, cp: u21) !void {
+        if (self.entries.items.len == 0) return;
+        if (!self.is_editing) try self.startEditing();
+
+        var utf8_buf: [4]u8 = undefined;
+        const len = try std.unicode.utf8Encode(cp, &utf8_buf);
+        
+        var iter = (std.unicode.Utf8View.init(self.edit_buffer.items) catch return).iterator();
+        var i: usize = 0;
+        while (i < self.char_offset) : (i += 1) _ = iter.nextCodepoint();
+        
+        try self.edit_buffer.insertSlice(self.allocator, iter.i, utf8_buf[0..len]);
+        self.char_offset += 1;
     }
 
     pub fn cdUp(self: *Browser) !void {
@@ -244,6 +345,7 @@ pub const Browser = struct {
         const new_path = try self.allocator.dupe(u8, parent);
         self.allocator.free(self.path);
         self.path = new_path;
+        self.max_size_len = 1;
         try self.refresh(exited_name);
     }
 
@@ -254,28 +356,23 @@ pub const Browser = struct {
         if (!entry.is_dir) return;
 
         if (entry.is_expanded) {
-            // Remove from history
             if (self.expansion_history.fetchRemove(entry.full_path)) |old| {
                 self.allocator.free(old.key);
             }
-            
             entry.is_expanded = false;
             const current_level = entry.level;
             var end_idx = idx + 1;
             while (end_idx < self.entries.items.len and self.entries.items[end_idx].level > current_level) : (end_idx += 1) {}
-            
             const remove_count = end_idx - (idx + 1);
             if (remove_count > 0) {
                 for (self.entries.items[idx+1..end_idx]) |*e| e.deinit();
                 self.entries.replaceRange(self.allocator, idx + 1, remove_count, &.{}) catch {};
             }
         } else {
-            // Add to history
             const path_key = try self.allocator.dupe(u8, entry.full_path);
             if (try self.expansion_history.fetchPut(path_key, {})) |old| {
                 self.allocator.free(old.key);
             }
-
             try self.recursiveExpand(idx);
         }
         try self.saveCurrentIndex();
@@ -340,6 +437,7 @@ pub const Browser = struct {
             try self.saveCurrentIndex();
             self.allocator.free(self.path);
             self.path = try self.allocator.dupe(u8, entry.full_path);
+            self.max_size_len = 1;
             try self.refresh(null);
             return .none;
         } else {

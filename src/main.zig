@@ -46,42 +46,97 @@ fn run(allocator: std.mem.Allocator, config: *Config, browser: *Browser, app_tui
 
         if (key_raw) |kr| {
             const key: tui.Key = @enumFromInt(kr);
-            if (key == .ctrl_c or key == @as(tui.Key, @enumFromInt('q')) or key == .esc) break;
+            if (key == .ctrl_c or (key == @as(tui.Key, @enumFromInt('q')) and !browser.is_editing)) break;
 
-            if (key == @as(tui.Key, @enumFromInt('j')) or key == @as(tui.Key, @enumFromInt('n')) or key == .ctrl_n or key == .down) {
-                browser.moveDown();
-            } else if (key == @as(tui.Key, @enumFromInt('k')) or key == @as(tui.Key, @enumFromInt('p')) or key == .ctrl_p or key == .up) {
-                browser.moveUp();
-            } else if (key == @as(tui.Key, @enumFromInt('h'))) {
-                try browser.cdUp();
-                full_redraw = true;
-            } else if (key == .tab) {
-                try browser.toggleExpand();
-                full_redraw = true;
-            } else if (key == @as(tui.Key, @enumFromInt('l')) or key == .ret) {
-                const action = try browser.openSelected();
-                switch (action) {
-                    .none => {
+            if (browser.is_editing) {
+                switch (key) {
+                    .esc, .ctrl_g => {
+                        try browser.stopEditing(true);
                         full_redraw = true;
                     },
-                    .editor => |path| {
-                        defer allocator.free(path);
-                        app_tui_ptr.*.deinit();
-                        const editor = std.posix.getenv("EDITOR") orelse "vi";
-                        var child = std.process.Child.init(&.{ editor, path }, allocator);
-                        _ = try child.spawnAndWait();
-                        app_tui_ptr.* = try tui.Tui.init(allocator);
+                    .up, .ctrl_p => {
+                        try browser.stopEditing(true);
+                        browser.moveUp();
                         full_redraw = true;
+                    },
+                    .down, .ctrl_n => {
+                        try browser.stopEditing(true);
+                        browser.moveDown();
+                        full_redraw = true;
+                    },
+                    .left, .ctrl_b => {
+                        browser.moveCharBackward();
+                    },
+                    .right, .ctrl_f => {
+                        browser.moveCharForward();
+                    },
+                    .ctrl_a => {
+                        browser.moveLineStart();
+                    },
+                    .ctrl_e => {
+                        browser.moveLineEnd();
+                    },
+                    .backspace => {
+                        try browser.backspace();
+                    },
+                    .ctrl_d => {
+                        try browser.deleteCharUnderCursor();
+                    },
+                    .ret => {
+                        try browser.stopEditing(true);
+                        full_redraw = true;
+                    },
+                    else => {
+                        if (kr >= 32 and kr < 0x1000) {
+                            try browser.insertChar(@intCast(kr));
+                        }
                     },
                 }
-            } else if (key == .ctrl_f or key == .right) {
-                browser.moveCharForward();
-            } else if (key == .ctrl_b or key == .left) {
-                browser.moveCharBackward();
-            } else if (key == .ctrl_a) {
-                browser.moveLineStart();
-            } else if (key == .ctrl_e) {
-                browser.moveLineEnd();
+            } else {
+                // Normal Mode
+                if (key == @as(tui.Key, @enumFromInt('j')) or key == @as(tui.Key, @enumFromInt('n')) or key == .ctrl_n or key == .down) {
+                    browser.moveDown();
+                } else if (key == @as(tui.Key, @enumFromInt('k')) or key == @as(tui.Key, @enumFromInt('p')) or key == .ctrl_p or key == .up) {
+                    browser.moveUp();
+                } else if (key == @as(tui.Key, @enumFromInt('h'))) {
+                    try browser.cdUp();
+                    full_redraw = true;
+                } else if (key == .tab) {
+                    try browser.toggleExpand();
+                    full_redraw = true;
+                } else if (key == @as(tui.Key, @enumFromInt('l')) or key == .ret) {
+                    const action = try browser.openSelected();
+                    switch (action) {
+                        .none => {
+                            full_redraw = true;
+                        },
+                        .editor => |path| {
+                            defer allocator.free(path);
+                            app_tui_ptr.*.deinit();
+                            const editor = std.posix.getenv("EDITOR") orelse "vi";
+                            var child = std.process.Child.init(&.{ editor, path }, allocator);
+                            _ = try child.spawnAndWait();
+                            app_tui_ptr.* = try tui.Tui.init(allocator);
+                            full_redraw = true;
+                        },
+                    }
+                } else if (key == .ctrl_f or key == .right) {
+                    browser.moveCharForward();
+                } else if (key == .ctrl_b or key == .left) {
+                    browser.moveCharBackward();
+                } else if (key == .ctrl_a) {
+                    browser.moveLineStart();
+                } else if (key == .ctrl_e) {
+                    browser.moveLineEnd();
+                } else if (key == @as(tui.Key, @enumFromInt('i'))) {
+                    try browser.startEditing();
+                } else if (key == .backspace) {
+                    try browser.startEditing();
+                    try browser.backspace();
+                } else if (key == .ctrl_d) {
+                    try browser.startEditing();
+                    try browser.deleteCharUnderCursor();
+                }
             }
         }
 

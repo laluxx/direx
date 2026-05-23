@@ -1,4 +1,5 @@
 #+title: TODO.org
 
-* Random thoughts [0/1]
+* Random thoughts [0/2]
   - [ ] C-s for a cached recursive search (Make it pretty please)
+  - [ ] When we are in edit-mode blink the cursor with 0.5s interval.
