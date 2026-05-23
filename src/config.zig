@@ -1,0 +1,156 @@
+const std = @import("std");
+const tui = @import("tui.zig");
+
+pub const Theme = struct {
+    directories: tui.Color,
+    datetime:    tui.Color,
+    numbers:     tui.Color,
+    default_fg:  tui.Color,
+    priv_d:      tui.Color,
+    priv_r:      tui.Color,
+    priv_w:      tui.Color,
+    priv_dash:   tui.Color,
+    priv_exec:   tui.Color,
+    heading:     tui.Color,
+};
+
+pub const Config = struct {
+    theme: Theme,
+    icons: std.StringHashMap([]const u8),
+    allocator: std.mem.Allocator,
+
+    pub fn load(allocator: std.mem.Allocator) !*Config {
+        const config = try allocator.create(Config);
+        config.* = .{
+            .theme = undefined,
+            .icons = std.StringHashMap([]const u8).init(allocator),
+            .allocator = allocator,
+        };
+
+        // Set defaults
+        config.theme = .{
+            .directories = tui.Color.fromRgb(0x95, 0x87, 0xDD),
+            .datetime    = tui.Color.fromRgb(0x95, 0x87, 0xDD),
+            .numbers     = tui.Color.fromRgb(0x41, 0xb0, 0xf3),
+            .default_fg  = tui.Color.fromRgb(0xe6, 0xe6, 0xe8),
+            .priv_d      = tui.Color.fromRgb(0x6b, 0xd9, 0xdb),
+            .priv_r      = tui.Color.fromRgb(0x6d, 0xd7, 0x97),
+            .priv_w      = tui.Color.fromRgb(0xea, 0xe4, 0x6a),
+            .priv_dash   = tui.Color.fromRgb(0x61, 0x5b, 0x75),
+            .priv_exec   = tui.Color.fromRgb(0xe8, 0x4c, 0x58),
+            .heading     = tui.Color.fromRgb(0x49, 0xbd, 0xb0),
+        };
+
+        try config.icons.put(try allocator.dupe(u8, ".zig"),      try allocator.dupe(u8, ""));
+        try config.icons.put(try allocator.dupe(u8, ".md"),       try allocator.dupe(u8, ""));
+        try config.icons.put(try allocator.dupe(u8, "directory"), try allocator.dupe(u8, ""));
+        try config.icons.put(try allocator.dupe(u8, "default"),   try allocator.dupe(u8, ""));
+
+        try config.reload();
+        return config;
+    }
+
+    pub fn deinit(self: *Config) void {
+        var iter = self.icons.iterator();
+        while (iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.icons.deinit();
+        self.allocator.destroy(self);
+    }
+
+    pub fn reload(self: *Config) !void {
+        const home = std.posix.getenv("HOME") orelse return error.HomeNotFound;
+        const config_dir_path = try std.fs.path.join(self.allocator, &.{ home, ".config", "direx" });
+        defer self.allocator.free(config_dir_path);
+
+        var config_dir = std.fs.openDirAbsolute(config_dir_path, .{}) catch return;
+        defer config_dir.close();
+
+        const content = config_dir.readFileAlloc("config.yaml", self.allocator, .unlimited) catch return;
+        defer self.allocator.free(content);
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        var current_section: enum { none, theme, privileges, icons } = .none;
+
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \r");
+            if (line.len == 0 or line[0] == '#') continue;
+
+            const indent = getIndent(raw_line);
+
+            if (std.mem.startsWith(u8, line, "theme:")) {
+                current_section = .theme;
+                continue;
+            } else if (std.mem.startsWith(u8, line, "privileges:") and current_section == .theme) {
+                current_section = .privileges;
+                continue;
+            } else if (std.mem.startsWith(u8, line, "icons:")) {
+                current_section = .icons;
+                continue;
+            }
+
+            if (current_section == .none) continue;
+
+            var parts = std.mem.splitScalar(u8, line, ':');
+            const key = std.mem.trim(u8, parts.next() orelse continue, " ");
+            const val = std.mem.trim(u8, parts.rest(), " \"'");
+
+            if (val.len == 0) continue;
+
+            switch (current_section) {
+                .theme => {
+                    if (indent == 2) {
+                        if (std.mem.eql(u8, key, "directories")) self.theme.directories = parseHex(val) orelse self.theme.directories;
+                        if (std.mem.eql(u8, key, "datetime"))    self.theme.datetime    = parseHex(val) orelse self.theme.datetime;
+                        if (std.mem.eql(u8, key, "numbers"))     self.theme.numbers     = parseHex(val) orelse self.theme.numbers;
+                        if (std.mem.eql(u8, key, "default_fg"))  self.theme.default_fg  = parseHex(val) orelse self.theme.default_fg;
+                        if (std.mem.eql(u8, key, "heading"))     self.theme.heading     = parseHex(val) orelse self.theme.heading;
+                    }
+                },
+                .privileges => {
+                    if (indent == 4) {
+                        if (std.mem.eql(u8, key, "d"))    self.theme.priv_d    = parseHex(val) orelse self.theme.priv_d;
+                        if (std.mem.eql(u8, key, "r"))    self.theme.priv_r    = parseHex(val) orelse self.theme.priv_r;
+                        if (std.mem.eql(u8, key, "w"))    self.theme.priv_w    = parseHex(val) orelse self.theme.priv_w;
+                        if (std.mem.eql(u8, key, "dash")) self.theme.priv_dash = parseHex(val) orelse self.theme.priv_dash;
+                        if (std.mem.eql(u8, key, "exec")) self.theme.priv_exec = parseHex(val) orelse self.theme.priv_exec;
+                    } else if (indent == 2) {
+                        current_section = .theme; // Back to theme
+                    }
+                },
+                .icons => {
+                    if (indent == 2) {
+                        const icon_key = try self.allocator.dupe(u8, key);
+                        const icon_val = try self.allocator.dupe(u8, val);
+                        if (self.icons.getPtr(icon_key)) |old| {
+                            self.allocator.free(old.*);
+                            old.* = icon_val;
+                            self.allocator.free(icon_key);
+                        } else {
+                            try self.icons.put(icon_key, icon_val);
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn getIndent(line: []const u8) usize {
+        var count: usize = 0;
+        for (line) |c| {
+            if (c == ' ') count += 1 else break;
+        }
+        return count;
+    }
+
+    fn parseHex(s: []const u8) ?tui.Color {
+        if (s.len != 7 or s[0] != '#') return null;
+        const r = std.fmt.parseInt(u8, s[1..3], 16) catch return null;
+        const g = std.fmt.parseInt(u8, s[3..5], 16) catch return null;
+        const b = std.fmt.parseInt(u8, s[5..7], 16) catch return null;
+        return tui.Color.fromRgb(r, g, b);
+    }
+};
