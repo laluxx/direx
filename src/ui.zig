@@ -11,22 +11,35 @@ var total_frame_time: i64 = 0;
 pub fn render(app_tui: *tui.Tui, browser: *Browser, config: *Config, full: bool) !void {
     const start_time = if (builtin.mode == .Debug) std.time.Instant.now() catch null else null;
     const size = struct { w: u16, h: u16 }{ .w = app_tui.width, .h = app_tui.height };
+    
+    // Viewport height (leaving space for heading and debug stats)
+    const viewport_h = size.h - 2;
+    
+    // Manage scrolling before any rendering
+    const scroll_changed = browser.manageScroll(viewport_h);
+    const force_full = full or scroll_changed;
 
-    if (full) {
+    if (force_full) {
         app_tui.clear();
         app_tui.writeString(0, 0, browser.path, .{ .fg = config.theme.heading });
         app_tui.writeString(@as(u16, @intCast(browser.path.len)), 0, ":", .{ .fg = config.theme.heading });
 
-        for (browser.entries.items, 0..) |*entry, i| {
-            try renderEntry(app_tui, browser, entry, i, config, size.h);
+        var i = browser.scroll_offset;
+        var y: u16 = 1;
+        while (i < browser.entries.items.len and y <= viewport_h) : ({ i += 1; y += 1; }) {
+            try renderEntry(app_tui, browser, &browser.entries.items[i], i, config, y);
         }
     } else {
+        // Surgical update within the viewport
         if (browser.prev_index) |prev| {
-            if (prev < browser.entries.items.len) {
-                try renderEntry(app_tui, browser, &browser.entries.items[prev], prev, config, size.h);
+            if (prev >= browser.scroll_offset and prev < browser.scroll_offset + viewport_h) {
+                const y = @as(u16, @intCast(prev - browser.scroll_offset + 1));
+                try renderEntry(app_tui, browser, &browser.entries.items[prev], prev, config, y);
             }
         }
-        try renderEntry(app_tui, browser, &browser.entries.items[browser.selected_index], browser.selected_index, config, size.h);
+        const curr = browser.selected_index;
+        const y = @as(u16, @intCast(curr - browser.scroll_offset + 1));
+        try renderEntry(app_tui, browser, &browser.entries.items[curr], curr, config, y);
     }
 
     if (builtin.mode == .Debug) {
@@ -36,16 +49,13 @@ pub fn render(app_tui: *tui.Tui, browser: *Browser, config: *Config, full: bool)
             frame_count += 1;
             total_frame_time += @as(i64, @intCast(diff));
             var stats_buf: [128]u8 = undefined;
-            const stats_text = try std.fmt.bufPrint(&stats_buf, "Frame: {d}ns | Avg: {d}ns | Size: {d}x{d}", .{ diff, @divTrunc(total_frame_time, @as(i64, @intCast(frame_count))), size.w, size.h });
+            const stats_text = try std.fmt.bufPrint(&stats_buf, "Frame: {d}ns | Avg: {d}ns | Scroll: {d} | Char: {d} | Size: {d}x{d}", .{ diff, @divTrunc(total_frame_time, @as(i64, @intCast(frame_count))), browser.scroll_offset, browser.char_offset, size.w, size.h });
             app_tui.writeString(0, size.h - 1, stats_text, .{ .fg = tui.Color.fromRgb(255, 255, 255), .bg = tui.Color.fromRgb(50, 50, 50) });
         }
     }
 }
 
-fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize, config: *Config, screen_h: u16) !void {
-    const y = @as(u16, @intCast(i + 1));
-    if (y >= screen_h - 1) return;
-
+fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize, config: *Config, y: u16) !void {
     const is_selected = (i == browser.selected_index);
     const base_style = tui.Style{ .fg = config.theme.default_fg };
 
@@ -142,10 +152,24 @@ fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize
     const name_style = if (entry.is_dir) tui.Style{ .fg = config.theme.directories } else tui.Style{ .fg = config.theme.default_fg };
     if (is_selected) {
         var iter = (std.unicode.Utf8View.init(entry.name) catch unreachable).iterator();
-        const first_cp = iter.nextCodepoint().?;
-        app_tui.setCell(x, y, first_cp, .{ .fg = name_style.fg, .reversed = true });
-        app_tui.writeString(x + 1, y, entry.name[iter.i..], name_style);
-        x += @as(u16, @intCast(try std.unicode.utf8CountCodepoints(entry.name)));
+        var cur_cp_idx: usize = 0;
+        const name_count = std.unicode.utf8CountCodepoints(entry.name) catch 0;
+        
+        while (iter.nextCodepoint()) |cp| {
+            if (cur_cp_idx == browser.char_offset) {
+                app_tui.setCell(x, y, cp, .{ .fg = name_style.fg, .reversed = true });
+            } else {
+                app_tui.setCell(x, y, cp, name_style);
+            }
+            x += 1;
+            cur_cp_idx += 1;
+        }
+        
+        // Handle cursor at the end (one past the last character)
+        if (browser.char_offset == name_count) {
+            app_tui.setCell(x, y, ' ', .{ .reversed = true });
+            x += 1;
+        }
     } else {
         app_tui.writeString(x, y, entry.name, name_style);
         x += @as(u16, @intCast(try std.unicode.utf8CountCodepoints(entry.name)));

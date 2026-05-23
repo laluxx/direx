@@ -31,6 +31,8 @@ pub const Browser = struct {
     entries:        std.ArrayList(FileEntry),
     selected_index: usize = 0,
     prev_index:     ?usize = null,
+    scroll_offset:  usize = 0,
+    char_offset:    usize = 0,
     allocator:      std.mem.Allocator,
     max_size_len:   usize = 1,
     
@@ -74,18 +76,25 @@ pub const Browser = struct {
         self.allocator.destroy(self);
     }
 
+    fn statNoFollow(dir: std.fs.Dir, sub_path: []const u8) !std.fs.File.Stat {
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        const io = threaded.ioBasic();
+        return std.Io.Dir.statPath(.{ .handle = dir.fd }, io, sub_path, .{ .follow_symlinks = false });
+    }
+
     pub fn refresh(self: *Browser, target_entry_name: ?[]const u8) !void {
         for (self.entries.items) |*entry| entry.deinit();
         self.entries.clearRetainingCapacity();
         self.max_size_len = 1;
         self.prev_index = null;
+        self.char_offset = 0;
 
         var dir = try std.fs.cwd().openDir(self.path, .{ .iterate = true });
         defer dir.close();
 
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
-            const stat = try dir.statFile(entry.name);
+            const stat = statNoFollow(dir, entry.name) catch continue;
             const full_path = try std.fs.path.join(self.allocator, &.{ self.path, entry.name });
             
             var fe = FileEntry{
@@ -144,6 +153,30 @@ pub const Browser = struct {
         gop.value_ptr.* = self.selected_index;
     }
 
+    pub fn manageScroll(self: *Browser, viewport_h: u16) bool {
+        if (viewport_h == 0) return false;
+        const h = @as(usize, viewport_h);
+        const old_offset = self.scroll_offset;
+
+        if (self.selected_index < self.scroll_offset or self.selected_index >= self.scroll_offset + h) {
+            // Emacs style: Center the cursor
+            if (self.selected_index < h / 2) {
+                self.scroll_offset = 0;
+            } else {
+                self.scroll_offset = self.selected_index - (h / 2);
+            }
+        }
+
+        // Clamp scroll offset
+        if (self.entries.items.len <= h) {
+            self.scroll_offset = 0;
+        } else if (self.scroll_offset + h > self.entries.items.len) {
+            self.scroll_offset = self.entries.items.len - h;
+        }
+
+        return old_offset != self.scroll_offset;
+    }
+
     fn formatPermissions(mode: u64, is_dir: bool) [10]u8 {
         var buf: [10]u8 = undefined;
         buf[0] = if (is_dir) 'd' else '-';
@@ -165,6 +198,7 @@ pub const Browser = struct {
         if (self.entries.items.len == 0) return;
         self.prev_index = self.selected_index;
         self.selected_index = if (self.selected_index == 0) self.entries.items.len - 1 else self.selected_index - 1;
+        self.char_offset = 0;
         self.saveCurrentIndex() catch {};
     }
 
@@ -172,7 +206,34 @@ pub const Browser = struct {
         if (self.entries.items.len == 0) return;
         self.prev_index = self.selected_index;
         self.selected_index = if (self.selected_index == self.entries.items.len - 1) 0 else self.selected_index + 1;
+        self.char_offset = 0;
         self.saveCurrentIndex() catch {};
+    }
+
+    pub fn moveCharForward(self: *Browser) void {
+        if (self.entries.items.len == 0) return;
+        const name = self.entries.items[self.selected_index].name;
+        const count = std.unicode.utf8CountCodepoints(name) catch return;
+        if (self.char_offset < count) { // Allow offset up to count (the space after the name)
+            self.char_offset += 1;
+        }
+    }
+
+    pub fn moveCharBackward(self: *Browser) void {
+        if (self.char_offset > 0) {
+            self.char_offset -= 1;
+        }
+    }
+
+    pub fn moveLineStart(self: *Browser) void {
+        self.char_offset = 0;
+    }
+
+    pub fn moveLineEnd(self: *Browser) void {
+        if (self.entries.items.len == 0) return;
+        const name = self.entries.items[self.selected_index].name;
+        const count = std.unicode.utf8CountCodepoints(name) catch return;
+        self.char_offset = count;
     }
 
     pub fn cdUp(self: *Browser) !void {
@@ -248,7 +309,7 @@ pub const Browser = struct {
         defer new_entries.deinit(self.allocator);
 
         while (try iter.next()) |e| {
-            const stat = try dir.statFile(e.name);
+            const stat = statNoFollow(dir, e.name) catch continue;
             const full_path = try std.fs.path.join(self.allocator, &.{ parent_path, e.name });
             var fe = FileEntry{
                 .name        = try self.allocator.dupe(u8, e.name),

@@ -36,6 +36,26 @@ pub const Cell = struct {
     }
 };
 
+pub const Key = enum(u32) {
+    none = 0,
+    up = 0x1001,
+    down = 0x1002,
+    right = 0x1003,
+    left = 0x1004,
+    ctrl_n = 14,
+    ctrl_p = 16,
+    ctrl_f = 6,
+    ctrl_b = 2,
+    ctrl_a = 1,
+    ctrl_e = 5,
+    ret = 13,
+    tab = 9,
+    esc = 27,
+    backspace = 127,
+    ctrl_c = 3,
+    _,
+};
+
 pub const Tui = struct {
     stdout: std.fs.File,
     stdin: std.fs.File,
@@ -163,7 +183,7 @@ pub const Tui = struct {
         try w.interface.flush();
     }
 
-    pub fn pollKey(self: *Tui, timeout_ms: u32) !?u21 {
+    pub fn pollKey(self: *Tui, timeout_ms: u32) !?u32 {
         var fds = [_]std.posix.pollfd{.{ .fd = self.stdin.handle, .events = std.posix.POLL.IN, .revents = 0 }};
         if (try std.posix.poll(&fds, @intCast(timeout_ms)) == 0) return null;
         var buf: [16]u8 = undefined;
@@ -171,16 +191,11 @@ pub const Tui = struct {
         if (n == 0) return null;
         if (buf[0] == 0x1b and n > 1) {
             if (buf[1] == '[') {
-                if (buf[2] == 'A') return 'k';
-                if (buf[2] == 'B') return 'j';
-                if (buf[2] == 'C') return 'l';
-                if (buf[2] == 'D') return 'h';
+                if (buf[2] == 'A') return @intFromEnum(Key.up);
+                if (buf[2] == 'B') return @intFromEnum(Key.down);
+                if (buf[2] == 'C') return @intFromEnum(Key.right);
+                if (buf[2] == 'D') return @intFromEnum(Key.left);
             }
-        }
-        if (buf[0] < 32) {
-            if (buf[0] == 14) return 'n' | 0x1000;
-            if (buf[0] == 16) return 'p' | 0x1000;
-            if (buf[0] == 3) return 0x03;
         }
         return buf[0];
     }
