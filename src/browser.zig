@@ -2,18 +2,27 @@ const std = @import("std");
 const Config = @import("config.zig").Config;
 
 pub const FileEntry = struct {
-    name:      []const u8,
-    is_dir:    bool,
-    mode:      u64,
-    nlink:     u64,
-    uid:       u32,
-    gid:       u32,
-    size:      u64,
-    mtime:     i128,
-    allocator: std.mem.Allocator,
+    name:         []const u8,
+    full_path:    []const u8,
+    is_dir:       bool,
+    is_expanded:  bool = false,
+    level:        usize = 0,
+    mode:         u64,
+    nlink:        u64,
+    size:         u64,
+    mtime:        i128,
+    
+    // Cached render data
+    icon:         []const u8 = "",
+    perm_str:     [10]u8 = undefined,
+    size_str:     []const u8 = "",
+    
+    allocator:    std.mem.Allocator,
 
     pub fn deinit(self: *FileEntry) void {
         self.allocator.free(self.name);
+        self.allocator.free(self.full_path);
+        if (self.size_str.len > 0) self.allocator.free(self.size_str);
     }
 };
 
@@ -21,16 +30,25 @@ pub const Browser = struct {
     path:           []const u8,
     entries:        std.ArrayList(FileEntry),
     selected_index: usize = 0,
+    prev_index:     ?usize = null,
     allocator:      std.mem.Allocator,
+    max_size_len:   usize = 1,
+    
+    // Path -> Selected Index history
+    cursor_history: std.StringHashMap(usize),
+    // Full Path -> Expanded state
+    expansion_history: std.StringHashMap(void),
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !*Browser {
         const browser = try allocator.create(Browser);
         browser.* = .{
             .path = try allocator.dupe(u8, path),
-            .entries = try std.ArrayList(FileEntry).initCapacity(allocator, 0),
+            .entries = try std.ArrayList(FileEntry).initCapacity(allocator, 64),
             .allocator = allocator,
+            .cursor_history = std.StringHashMap(usize).init(allocator),
+            .expansion_history = std.StringHashMap(void).init(allocator),
         };
-        try browser.refresh();
+        try browser.refresh(null);
         return browser;
     }
 
@@ -40,14 +58,27 @@ pub const Browser = struct {
             entry.deinit();
         }
         self.entries.deinit(self.allocator);
+        
+        var c_iter = self.cursor_history.iterator();
+        while (c_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.cursor_history.deinit();
+
+        var e_iter = self.expansion_history.iterator();
+        while (e_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.expansion_history.deinit();
+        
         self.allocator.destroy(self);
     }
 
-    pub fn refresh(self: *Browser) !void {
-        for (self.entries.items) |*entry| {
-            entry.deinit();
-        }
+    pub fn refresh(self: *Browser, target_entry_name: ?[]const u8) !void {
+        for (self.entries.items) |*entry| entry.deinit();
         self.entries.clearRetainingCapacity();
+        self.max_size_len = 1;
+        self.prev_index = null;
 
         var dir = try std.fs.cwd().openDir(self.path, .{ .iterate = true });
         defer dir.close();
@@ -55,75 +86,203 @@ pub const Browser = struct {
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
             const stat = try dir.statFile(entry.name);
-            try self.entries.append(self.allocator, .{
-                .name      = try self.allocator.dupe(u8, entry.name),
-                .is_dir    = entry.kind == .directory,
-                .mode      = stat.mode,
-                .nlink     = 1,    // std.fs.File.Stat doesn't seem to have nlink in all OSes, but let's assume 1 for now or find a way.
-                .uid       = 1000, // Placeholder
-                .gid       = 1000, // Placeholder
-                .size      = stat.size,
-                .mtime     = stat.mtime.nanoseconds,
-                .allocator = self.allocator,
-            });
+            const full_path = try std.fs.path.join(self.allocator, &.{ self.path, entry.name });
+            
+            var fe = FileEntry{
+                .name        = try self.allocator.dupe(u8, entry.name),
+                .full_path   = full_path,
+                .is_dir      = entry.kind == .directory,
+                .mode        = stat.mode,
+                .nlink       = 1,
+                .size        = stat.size,
+                .mtime       = stat.mtime.nanoseconds,
+                .allocator   = self.allocator,
+            };
+            
+            fe.perm_str = formatPermissions(fe.mode, fe.is_dir);
+            var buf: [32]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "{d}", .{stat.size});
+            fe.size_str = try self.allocator.dupe(u8, s);
+            if (s.len > self.max_size_len) self.max_size_len = s.len;
+            
+            try self.entries.append(self.allocator, fe);
         }
 
-        // Sort entries: directories first, then alphabetical
         std.mem.sort(FileEntry, self.entries.items, {}, sortEntries);
 
-        if (self.selected_index >= self.entries.items.len and self.entries.items.len > 0) {
-            self.selected_index = self.entries.items.len - 1;
+        // Re-expand entries based on history
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = &self.entries.items[i];
+            if (entry.is_dir and self.expansion_history.contains(entry.full_path)) {
+                try self.expandEntryAtIndex(i);
+            }
+            i += 1;
+        }
+
+        // Restore selection
+        if (self.cursor_history.get(self.path)) |idx| {
+            self.selected_index = if (idx < self.entries.items.len) idx else 0;
+        } else if (target_entry_name) |target| {
+            self.selected_index = 0;
+            for (self.entries.items, 0..) |entry, idx| {
+                if (std.mem.eql(u8, entry.name, target)) {
+                    self.selected_index = idx;
+                    break;
+                }
+            }
+        } else {
+            self.selected_index = 0;
         }
     }
 
-    fn sortEntries(_: void, a: FileEntry, b: FileEntry) bool {
-        if (a.is_dir != b.is_dir) {
-            return a.is_dir;
+    pub fn saveCurrentIndex(self: *Browser) !void {
+        const gop = try self.cursor_history.getOrPut(self.path);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.allocator.dupe(u8, self.path);
         }
+        gop.value_ptr.* = self.selected_index;
+    }
+
+    fn formatPermissions(mode: u64, is_dir: bool) [10]u8 {
+        var buf: [10]u8 = undefined;
+        buf[0] = if (is_dir) 'd' else '-';
+        const chars = "rwxrwxrwx";
+        for (0..9) |pi| {
+            const bit = @as(u64, 1) << @as(u6, @intCast(8 - pi));
+            buf[pi+1] = if ((mode & bit) != 0) chars[pi] else '-';
+        }
+        return buf;
+    }
+
+    fn sortEntries(_: void, a: FileEntry, b: FileEntry) bool {
+        if (a.level != b.level) return false;
+        if (a.is_dir != b.is_dir) return a.is_dir;
         return std.mem.lessThan(u8, a.name, b.name);
     }
 
     pub fn moveUp(self: *Browser) void {
         if (self.entries.items.len == 0) return;
-        if (self.selected_index == 0) {
-            self.selected_index = self.entries.items.len - 1;
-        } else {
-            self.selected_index -= 1;
-        }
+        self.prev_index = self.selected_index;
+        self.selected_index = if (self.selected_index == 0) self.entries.items.len - 1 else self.selected_index - 1;
+        self.saveCurrentIndex() catch {};
     }
 
     pub fn moveDown(self: *Browser) void {
         if (self.entries.items.len == 0) return;
-        if (self.selected_index == self.entries.items.len - 1) {
-            self.selected_index = 0;
-        } else {
-            self.selected_index += 1;
-        }
+        self.prev_index = self.selected_index;
+        self.selected_index = if (self.selected_index == self.entries.items.len - 1) 0 else self.selected_index + 1;
+        self.saveCurrentIndex() catch {};
     }
 
     pub fn cdUp(self: *Browser) !void {
+        try self.saveCurrentIndex();
+        const exited_name = try self.allocator.dupe(u8, std.fs.path.basename(self.path));
+        defer self.allocator.free(exited_name);
         const parent = std.fs.path.dirname(self.path) orelse return;
         const new_path = try self.allocator.dupe(u8, parent);
         self.allocator.free(self.path);
         self.path = new_path;
-        self.selected_index = 0;
-        try self.refresh();
+        try self.refresh(exited_name);
+    }
+
+    pub fn toggleExpand(self: *Browser) !void {
+        if (self.entries.items.len == 0) return;
+        const idx = self.selected_index;
+        var entry = &self.entries.items[idx];
+        if (!entry.is_dir) return;
+
+        if (entry.is_expanded) {
+            // Remove from history
+            if (self.expansion_history.fetchRemove(entry.full_path)) |old| {
+                self.allocator.free(old.key);
+            }
+            
+            entry.is_expanded = false;
+            const current_level = entry.level;
+            var end_idx = idx + 1;
+            while (end_idx < self.entries.items.len and self.entries.items[end_idx].level > current_level) : (end_idx += 1) {}
+            
+            const remove_count = end_idx - (idx + 1);
+            if (remove_count > 0) {
+                for (self.entries.items[idx+1..end_idx]) |*e| e.deinit();
+                self.entries.replaceRange(self.allocator, idx + 1, remove_count, &.{}) catch {};
+            }
+        } else {
+            // Add to history
+            const path_key = try self.allocator.dupe(u8, entry.full_path);
+            if (try self.expansion_history.fetchPut(path_key, {})) |old| {
+                self.allocator.free(old.key);
+            }
+
+            try self.recursiveExpand(idx);
+        }
+        try self.saveCurrentIndex();
+    }
+
+    fn recursiveExpand(self: *Browser, start_idx: usize) !void {
+        try self.expandEntryAtIndex(start_idx);
+        var i = start_idx + 1;
+        const parent_level = self.entries.items[start_idx].level;
+        while (i < self.entries.items.len) {
+            const entry = &self.entries.items[i];
+            if (entry.level <= parent_level) break;
+            if (entry.is_dir and self.expansion_history.contains(entry.full_path)) {
+                try self.expandEntryAtIndex(i);
+            }
+            i += 1;
+        }
+    }
+
+    fn expandEntryAtIndex(self: *Browser, idx: usize) !void {
+        var entry = &self.entries.items[idx];
+        entry.is_expanded = true;
+        const current_level = entry.level;
+        const parent_path = entry.full_path;
+
+        var dir = std.fs.openDirAbsolute(parent_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        var new_entries = try std.ArrayList(FileEntry).initCapacity(self.allocator, 16);
+        defer new_entries.deinit(self.allocator);
+
+        while (try iter.next()) |e| {
+            const stat = try dir.statFile(e.name);
+            const full_path = try std.fs.path.join(self.allocator, &.{ parent_path, e.name });
+            var fe = FileEntry{
+                .name        = try self.allocator.dupe(u8, e.name),
+                .full_path   = full_path,
+                .is_dir      = e.kind == .directory,
+                .level       = current_level + 1,
+                .mode        = stat.mode,
+                .nlink       = 1,
+                .size        = stat.size,
+                .mtime       = stat.mtime.nanoseconds,
+                .allocator   = self.allocator,
+            };
+            fe.perm_str = formatPermissions(fe.mode, fe.is_dir);
+            var buf: [32]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "{d}", .{stat.size});
+            fe.size_str = try self.allocator.dupe(u8, s);
+            if (s.len > self.max_size_len) self.max_size_len = s.len;
+            try new_entries.append(self.allocator, fe);
+        }
+        std.mem.sort(FileEntry, new_entries.items, {}, sortEntries);
+        try self.entries.insertSlice(self.allocator, idx + 1, new_entries.items);
     }
 
     pub fn openSelected(self: *Browser) !union(enum) { none, editor: []const u8 } {
         if (self.entries.items.len == 0) return .none;
         const entry = self.entries.items[self.selected_index];
-        const full_path = try std.fs.path.join(self.allocator, &.{ self.path, entry.name });
-        defer self.allocator.free(full_path);
-
         if (entry.is_dir) {
+            try self.saveCurrentIndex();
             self.allocator.free(self.path);
-            self.path = try self.allocator.dupe(u8, full_path);
-            self.selected_index = 0;
-            try self.refresh();
+            self.path = try self.allocator.dupe(u8, entry.full_path);
+            try self.refresh(null);
             return .none;
         } else {
-            return .{ .editor = try self.allocator.dupe(u8, full_path) };
+            return .{ .editor = try self.allocator.dupe(u8, entry.full_path) };
         }
     }
 };

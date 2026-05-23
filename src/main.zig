@@ -9,36 +9,44 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Initialize config
     var config = try Config.load(allocator);
     defer config.deinit();
 
-    // Initialize browser
     const cwd = try std.process.getCwdAlloc(allocator);
     defer allocator.free(cwd);
     var browser = try Browser.init(allocator, cwd);
     defer browser.deinit();
 
-    // Initialize TUI
     var app_tui = try tui.Tui.init(allocator);
     defer app_tui.deinit();
 
-    // Start inotify thread for config watching
     var reload_requested = std.atomic.Value(bool).init(false);
-    const watch_thread = try std.Thread.spawn(.{}, watchConfig, .{ allocator, &reload_requested });
+    const watch_thread = try std.Thread.spawn(.{}, watchConfig, .{&reload_requested});
     watch_thread.detach();
+
+    // Wrap the main loop to ensure app_tui.deinit() is called on error
+    run(allocator, config, browser, app_tui, &reload_requested) catch |err| {
+        // app_tui.deinit() is already called by defer, but we want to be sure
+        // before the stack trace is printed.
+        app_tui.deinit();
+        return err;
+    };
+}
+
+fn run(allocator: std.mem.Allocator, config: *Config, browser: *Browser, app_tui_ptr: *tui.Tui, reload_requested: *std.atomic.Value(bool)) !void {
+    var app_tui = app_tui_ptr;
+    var full_redraw = true;
 
     while (true) {
         if (reload_requested.swap(false, .monotonic)) {
             config.reload() catch {};
+            full_redraw = true;
         }
 
-        try ui.render(app_tui, browser, config);
-        try app_tui.flush();
-
         const key = try app_tui.pollKey(100);
+
         if (key) |k| {
-            if (k == 0x03 or k == 'q' or k == 27) break; // C-c, q, Esc
+            if (k == 0x03 or k == 'q' or k == 27) break;
 
             if (k == 'j' or k == 'n' or k == ('n' | 0x1000)) {
                 browser.moveDown();
@@ -46,34 +54,47 @@ pub fn main() !void {
                 browser.moveUp();
             } else if (k == 'h') {
                 try browser.cdUp();
+                full_redraw = true;
+            } else if (k == '\t') {
+                try browser.toggleExpand();
+                full_redraw = true;
             } else if (k == 'l' or k == '\r') {
                 const action = try browser.openSelected();
                 switch (action) {
-                    .none => {},
+                    .none => {
+                        full_redraw = true;
+                    },
                     .editor => |path| {
                         defer allocator.free(path);
                         app_tui.deinit();
                         const editor = std.posix.getenv("EDITOR") orelse "vi";
                         var child = std.process.Child.init(&.{ editor, path }, allocator);
                         _ = try child.spawnAndWait();
-                        // Re-init TUI
                         app_tui = try tui.Tui.init(allocator);
+                        full_redraw = true;
                     },
                 }
             }
         }
+
+        if (key != null or full_redraw) {
+            try ui.render(app_tui, browser, config, full_redraw);
+            try app_tui.flush();
+            full_redraw = false;
+        }
     }
 }
 
-fn watchConfig(allocator: std.mem.Allocator, reload_requested: *std.atomic.Value(bool)) !void {
+fn watchConfig(reload_requested: *std.atomic.Value(bool)) !void {
     const home = std.posix.getenv("HOME") orelse return;
-    const config_dir = try std.fs.path.join(allocator, &.{ home, ".config", "direx" });
-    defer allocator.free(config_dir);
+    var path_buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&path_buf);
+    const config_dir = std.fs.path.join(fba.allocator(), &.{ home, ".config", "direx" }) catch return;
 
-    const fd = try std.posix.inotify_init1(std.os.linux.IN.CLOEXEC);
+    const fd = std.posix.inotify_init1(std.os.linux.IN.CLOEXEC) catch return;
     defer std.posix.close(fd);
 
-    _ = try std.posix.inotify_add_watch(fd, config_dir, std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE);
+    _ = std.posix.inotify_add_watch(fd, config_dir, std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE) catch return;
 
     var buf: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
     while (true) {

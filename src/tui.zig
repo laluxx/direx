@@ -18,11 +18,12 @@ pub const Style = struct {
     fg: ?Color = null,
     bg: ?Color = null,
     reversed: bool = false,
+    bold: bool = false,
 
     pub fn eql(self: Style, other: Style) bool {
         const fg_eq = if (self.fg == null and other.fg == null) true else if (self.fg != null and other.fg != null) self.fg.?.eql(other.fg.?) else false;
         const bg_eq = if (self.bg == null and other.bg == null) true else if (self.bg != null and other.bg != null) self.bg.?.eql(other.bg.?) else false;
-        return fg_eq and bg_eq and self.reversed == other.reversed;
+        return fg_eq and bg_eq and self.reversed == other.reversed and self.bold == other.bold;
     }
 };
 
@@ -40,11 +41,11 @@ pub const Tui = struct {
     stdin: std.fs.File,
     original_termios: std.posix.termios,
     allocator: std.mem.Allocator,
-
+    
     width: u16 = 0,
     height: u16 = 0,
-
-    back_buffer:  []Cell = &.{},
+    
+    back_buffer: []Cell = &.{},
     front_buffer: []Cell = &.{},
 
     pub fn init(allocator: std.mem.Allocator) !*Tui {
@@ -69,7 +70,7 @@ pub const Tui = struct {
 
         try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
         try tui.stdout.writeAll("\x1b[?1049h\x1b[?25l"); // Alt screen, hide cursor
-
+        
         try tui.resize();
 
         return tui;
@@ -88,18 +89,22 @@ pub const Tui = struct {
         if (std.posix.system.ioctl(self.stdout.handle, std.posix.T.IOCGWINSZ, @intFromPtr(&size)) != 0) {
             size = .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
         }
-
+        
         if (size.row == self.height and size.col == self.width) return;
-
+        
         self.width = size.col;
         self.height = size.row;
-
+        
         const new_len = @as(usize, self.width) * @as(usize, self.height);
         self.back_buffer = try self.allocator.realloc(self.back_buffer, new_len);
         self.front_buffer = try self.allocator.realloc(self.front_buffer, new_len);
-
+        
         @memset(self.back_buffer, Cell{});
-        @memset(self.front_buffer, Cell{ .char = 0 }); // Force redraw on first flush
+        @memset(self.front_buffer, Cell{ .char = 0 }); // Force redraw
+    }
+
+    pub fn clear(self: *Tui) void {
+        @memset(self.back_buffer, Cell{});
     }
 
     pub fn setCell(self: *Tui, x: u16, y: u16, char: u21, style: Style) void {
@@ -119,7 +124,7 @@ pub const Tui = struct {
     }
 
     pub fn flush(self: *Tui) !void {
-        var scratch_buffer: [8192]u8 = undefined;
+        var scratch_buffer: [16384]u8 = undefined;
         var w = self.stdout.writer(&scratch_buffer);
         var current_style: Style = .{};
         var cursor_x: u16 = 9999;
@@ -132,71 +137,51 @@ pub const Tui = struct {
                 const front = self.front_buffer[idx];
 
                 if (!back.eql(front)) {
-                    // Move cursor if needed
                     if (cursor_x != x or cursor_y != y) {
                         try w.interface.print("\x1b[{d};{d}H", .{ y + 1, x + 1 });
                     }
-
-                    // Update style if needed
+                    
                     if (!back.style.eql(current_style)) {
                         try w.interface.writeAll("\x1b[0m");
-                        if (back.style.fg) |fg| {
-                            try w.interface.print("\x1b[38;2;{d};{d};{d}m", .{ fg.r, fg.g, fg.b });
-                        }
-                        if (back.style.bg) |bg| {
-                            try w.interface.print("\x1b[48;2;{d};{d};{d}m", .{ bg.r, bg.g, bg.b });
-                        }
-                        if (back.style.reversed) {
-                            try w.interface.writeAll("\x1b[7m");
-                        }
+                        if (back.style.fg) |fg| try w.interface.print("\x1b[38;2;{d};{d};{d}m", .{ fg.r, fg.g, fg.b });
+                        if (back.style.bg) |bg| try w.interface.print("\x1b[48;2;{d};{d};{d}m", .{ bg.r, bg.g, bg.b });
+                        if (back.style.reversed) try w.interface.writeAll("\x1b[7m");
+                        if (back.style.bold) try w.interface.writeAll("\x1b[1m");
                         current_style = back.style;
                     }
 
-                    // Write character
                     var buf: [4]u8 = undefined;
                     const len = try std.unicode.utf8Encode(back.char, &buf);
                     try w.interface.writeAll(buf[0..len]);
-
+                    
                     self.front_buffer[idx] = back;
                     cursor_x = @as(u16, @intCast(x)) + 1;
                     cursor_y = @as(u16, @intCast(y));
                 }
             }
         }
-
         try w.interface.flush();
-        @memset(self.back_buffer, Cell{});
     }
 
     pub fn pollKey(self: *Tui, timeout_ms: u32) !?u21 {
-        var fds = [_]std.posix.pollfd{.{
-            .fd = self.stdin.handle,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-
-        const ready = try std.posix.poll(&fds, @intCast(timeout_ms));
-        if (ready == 0) return null;
-
+        var fds = [_]std.posix.pollfd{.{ .fd = self.stdin.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&fds, @intCast(timeout_ms)) == 0) return null;
         var buf: [16]u8 = undefined;
         const n = try self.stdin.read(&buf);
         if (n == 0) return null;
-
         if (buf[0] == 0x1b and n > 1) {
             if (buf[1] == '[') {
-                if (buf[2] == 'A') return 'k'; // Up
-                if (buf[2] == 'B') return 'j'; // Down
-                if (buf[2] == 'C') return 'l'; // Right
-                if (buf[2] == 'D') return 'h'; // Left
+                if (buf[2] == 'A') return 'k';
+                if (buf[2] == 'B') return 'j';
+                if (buf[2] == 'C') return 'l';
+                if (buf[2] == 'D') return 'h';
             }
         }
-
         if (buf[0] < 32) {
-            if (buf[0] == 14) return 'n' | 0x1000; // C-n
-            if (buf[0] == 16) return 'p' | 0x1000; // C-p
-            if (buf[0] == 3)  return 0x03;         // C-c
+            if (buf[0] == 14) return 'n' | 0x1000;
+            if (buf[0] == 16) return 'p' | 0x1000;
+            if (buf[0] == 3) return 0x03;
         }
-
         return buf[0];
     }
 };
