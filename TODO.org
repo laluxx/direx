@@ -3,3 +3,4 @@
 * Random thoughts [0/2]
   - [ ] C-s for a cached recursive search (Make it pretty please)
   - [ ] When we are in edit-mode blink the cursor with 0.5s interval.
+  - [ ] f key to run file on the entry under cursor

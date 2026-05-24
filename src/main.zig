@@ -9,24 +9,38 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // 1. Parse Arguments
+    var initial_path: ?[]const u8 = null;
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
+    _ = args.next(); // Skip binary name
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--print-last-dir")) {
+            _ = args.next(); // Ignore for now
+        } else {
+            initial_path = arg;
+        }
+    }
+
+    // 2. Start Config Loading
     var config = try Config.load(allocator);
     defer config.deinit();
 
-    const initial_cwd = try std.process.getCwdAlloc(allocator);
-    defer allocator.free(initial_cwd);
+    // 3. Prepare Browser
+    const cwd = if (initial_path) |p| try allocator.dupe(u8, p) else try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
     
-    var browser = try Browser.init(allocator, initial_cwd);
+    var browser = try Browser.init(allocator, cwd);
     defer browser.deinit();
 
+    // 4. Launch TUI
     var app_tui = try tui.Tui.init(allocator);
-    
-    var reload_requested = std.atomic.Value(bool).init(false);
-    const watch_thread = try std.Thread.spawn(.{}, watchConfig, .{&reload_requested});
-    watch_thread.detach();
 
-    try browser.refresh(null);
+    // Initial render
+    try ui.render(app_tui, browser, config, true);
+    try app_tui.flush();
 
-    run(allocator, config, browser, &app_tui, &reload_requested) catch |err| {
+    run(allocator, config, browser, &app_tui) catch |err| {
         app_tui.deinit();
         return err;
     };
@@ -36,18 +50,13 @@ pub fn main() !void {
 
     app_tui.deinit();
 
-    // 4. If the directory changed, replace process with shell
-    if (!std.mem.eql(u8, final_path, initial_cwd)) {
+    if (!std.mem.eql(u8, final_path, cwd)) {
         const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
         const shell_z = try allocator.dupeZ(u8, shell);
         defer allocator.free(shell_z);
-
         const argv = &[_:null]?[*:0]const u8{ shell_z.ptr, null };
-
-        // Re-construct environment
         var env = try std.process.getEnvMap(allocator);
         defer env.deinit();
-        
         var env_list = try std.ArrayList(?[*:0]const u8).initCapacity(allocator, env.count() + 1);
         defer {
             for (env_list.items) |line| {
@@ -55,7 +64,6 @@ pub fn main() !void {
             }
             env_list.deinit(allocator);
         }
-
         var env_ptr = env.iterator();
         while (env_ptr.next()) |entry| {
             const line = try std.fmt.allocPrint(allocator, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
@@ -64,140 +72,147 @@ pub fn main() !void {
             try env_list.append(allocator, line_z.ptr);
         }
         try env_list.append(allocator, null);
-
         std.posix.chdir(final_path) catch {};
         const envp: [*:null]const ?[*:0]const u8 = @ptrCast(env_list.items.ptr);
         _ = std.posix.execvpeZ(shell_z, argv.ptr, envp) catch {};
     }
 }
 
-fn run(allocator: std.mem.Allocator, config: *Config, browser: *Browser, app_tui_ptr: **tui.Tui, reload_requested: *std.atomic.Value(bool)) !void {
-    var full_redraw = true;
+fn run(allocator: std.mem.Allocator, config: *Config, browser: *Browser, app_tui_ptr: **tui.Tui) !void {
+    var full_redraw = false;
+    
+    var last_blink_instant = try std.time.Instant.now();
 
     while (true) {
-        if (reload_requested.swap(false, .monotonic)) {
-            config.reload() catch {};
-            full_redraw = true;
+        var timeout: i32 = -1;
+        
+        if (browser.is_editing) {
+            const now = try std.time.Instant.now();
+            const blink_ms: i32 = 500;
+            const elapsed_since_blink = @divTrunc(now.since(last_blink_instant), std.time.ns_per_ms);
+            timeout = @max(@as(i32, 0), blink_ms - @as(i32, @intCast(elapsed_since_blink)));
         }
 
-        const key_raw = try app_tui_ptr.*.pollKey(100);
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = app_tui_ptr.*.stdin.handle, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = browser.inotify_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        };
 
-        if (key_raw) |kr| {
-            const key: tui.Key = @enumFromInt(kr);
-            if (key == .ctrl_c or (key == @as(tui.Key, @enumFromInt('q')) and !browser.is_editing)) break;
+        const ready = try std.posix.poll(&fds, timeout);
+        
+        var fs_event = false;
+        var config_event = false;
+        var key_pressed = false;
+        var blink_event = false;
 
-            if (browser.is_editing) {
-                switch (key) {
-                    .esc, .ctrl_g => {
-                        try browser.stopEditing(true);
-                        full_redraw = true;
-                    },
-                    .up, .ctrl_p => {
-                        try browser.stopEditing(true);
-                        browser.moveUp();
-                        full_redraw = true;
-                    },
-                    .down, .ctrl_n => {
-                        try browser.stopEditing(true);
-                        browser.moveDown();
-                        full_redraw = true;
-                    },
-                    .left, .ctrl_b => {
-                        browser.moveCharBackward();
-                    },
-                    .right, .ctrl_f => {
-                        browser.moveCharForward();
-                    },
-                    .ctrl_a => {
-                        browser.moveLineStart();
-                    },
-                    .ctrl_e => {
-                        browser.moveLineEnd();
-                    },
-                    .backspace => {
-                        try browser.backspace();
-                    },
-                    .ctrl_d => {
-                        try browser.deleteCharUnderCursor();
-                    },
-                    .ret => {
-                        try browser.stopEditing(true);
-                        full_redraw = true;
-                    },
-                    else => {
-                        if (kr >= 32 and kr < 0x1000) {
-                            try browser.insertChar(@intCast(kr));
-                        }
-                    },
+        if (ready == 0 and browser.is_editing) {
+            blink_event = true;
+            browser.is_cursor_visible = !browser.is_cursor_visible;
+            last_blink_instant = try std.time.Instant.now();
+        } else {
+            if (fds[1].revents & std.posix.POLL.IN != 0) {
+                var buf: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
+                const n = try std.posix.read(browser.inotify_fd, &buf);
+                
+                var i: usize = 0;
+                while (i < n) {
+                    const event: *std.os.linux.inotify_event = @ptrCast(@alignCast(&buf[i]));
+                    if (event.wd == browser.cwd_wd) fs_event = true;
+                    if (event.wd == browser.config_wd) config_event = true;
+                    i += @sizeOf(std.os.linux.inotify_event) + event.len;
                 }
-            } else {
-                // Normal Mode
-                if (key == @as(tui.Key, @enumFromInt('j')) or key == @as(tui.Key, @enumFromInt('n')) or key == .ctrl_n or key == .down) {
-                    browser.moveDown();
-                } else if (key == @as(tui.Key, @enumFromInt('k')) or key == @as(tui.Key, @enumFromInt('p')) or key == .ctrl_p or key == .up) {
-                    browser.moveUp();
-                } else if (key == @as(tui.Key, @enumFromInt('h'))) {
-                    try browser.cdUp();
-                    full_redraw = true;
-                } else if (key == .tab) {
-                    try browser.toggleExpand();
-                    full_redraw = true;
-                } else if (key == @as(tui.Key, @enumFromInt('l')) or key == .ret) {
-                    const action = try browser.openSelected();
-                    switch (action) {
-                        .none => {
+            }
+
+            if (fds[0].revents & std.posix.POLL.IN != 0) {
+                const key_raw = try app_tui_ptr.*.pollKey(0);
+                if (key_raw) |kr| {
+                    key_pressed = true;
+                    browser.is_cursor_visible = true;
+                    last_blink_instant = try std.time.Instant.now();
+                    
+                    const key: tui.Key = @enumFromInt(kr);
+                    if (key == .ctrl_c or (key == @as(tui.Key, @enumFromInt('q')) and !browser.is_editing)) break;
+
+                    if (browser.is_editing) {
+                        switch (key) {
+                            .esc, .ctrl_g => try browser.stopEditing(true),
+                            .up, .ctrl_p => { try browser.stopEditing(true); browser.moveUp(); },
+                            .down, .ctrl_n => { try browser.stopEditing(true); browser.moveDown(); },
+                            .left, .ctrl_b => browser.moveCharBackward(),
+                            .right, .ctrl_f => browser.moveCharForward(),
+                            .ctrl_a => browser.moveLineStart(),
+                            .ctrl_e => browser.moveLineEnd(),
+                            .backspace => try browser.backspace(),
+                            .ctrl_d => try browser.deleteCharUnderCursor(),
+                            .ret => try browser.stopEditing(true),
+                            else => if (kr >= 32 and kr < 0x1000) try browser.insertChar(@intCast(kr)),
+                        }
+                        full_redraw = true;
+                    } else {
+                        if (key == @as(tui.Key, @enumFromInt('j')) or key == @as(tui.Key, @enumFromInt('n')) or key == .ctrl_n or key == .down) {
+                            browser.moveDown();
+                        } else if (key == @as(tui.Key, @enumFromInt('k')) or key == @as(tui.Key, @enumFromInt('p')) or key == .ctrl_p or key == .up) {
+                            browser.moveUp();
+                        } else if (key == .g) {
+                            browser.moveTop();
+                        } else if (key == .G) {
+                            browser.moveBottom();
+                        } else if (key == @as(tui.Key, @enumFromInt('h'))) {
+                            try browser.cdUp();
                             full_redraw = true;
-                        },
-                        .editor => |path| {
-                            defer allocator.free(path);
-                            app_tui_ptr.*.deinit();
-                            const editor = std.posix.getenv("EDITOR") orelse "vi";
-                            var child = std.process.Child.init(&.{ editor, path }, allocator);
-                            _ = try child.spawnAndWait();
-                            app_tui_ptr.* = try tui.Tui.init(allocator);
+                        } else if (key == .tab) {
+                            try browser.toggleExpand();
                             full_redraw = true;
-                        },
+                        } else if (key == @as(tui.Key, @enumFromInt('l')) or key == .ret) {
+                            const action = try browser.openSelected();
+                            switch (action) {
+                                .none => full_redraw = true,
+                                .editor => |path| {
+                                    defer allocator.free(path);
+                                    app_tui_ptr.*.deinit();
+                                    const editor = std.posix.getenv("EDITOR") orelse "vi";
+                                    var child = std.process.Child.init(&.{ editor, path }, allocator);
+                                    _ = try child.spawnAndWait();
+                                    app_tui_ptr.* = try tui.Tui.init(allocator);
+                                    full_redraw = true;
+                                },
+                            }
+                        } else if (key == .ctrl_f or key == .right) {
+                            browser.moveCharForward();
+                        } else if (key == .ctrl_b or key == .left) {
+                            browser.moveCharBackward();
+                        } else if (key == .ctrl_a) {
+                            browser.moveLineStart();
+                        } else if (key == .ctrl_e) {
+                            browser.moveLineEnd();
+                        } else if (key == @as(tui.Key, @enumFromInt('i'))) {
+                            try browser.startEditing();
+                        } else if (key == .backspace) {
+                            try browser.startEditing();
+                            try browser.backspace();
+                        } else if (key == .ctrl_d) {
+                            try browser.startEditing();
+                            try browser.deleteCharUnderCursor();
+                        }
                     }
-                } else if (key == .ctrl_f or key == .right) {
-                    browser.moveCharForward();
-                } else if (key == .ctrl_b or key == .left) {
-                    browser.moveCharBackward();
-                } else if (key == .ctrl_a) {
-                    browser.moveLineStart();
-                } else if (key == .ctrl_e) {
-                    browser.moveLineEnd();
-                } else if (key == @as(tui.Key, @enumFromInt('i'))) {
-                    try browser.startEditing();
-                } else if (key == .backspace) {
-                    try browser.startEditing();
-                    try browser.backspace();
-                } else if (key == .ctrl_d) {
-                    try browser.startEditing();
-                    try browser.deleteCharUnderCursor();
                 }
             }
         }
 
-        if (key_raw != null or full_redraw) {
+        if (config_event) {
+            config.reload() catch {};
+            full_redraw = true;
+        }
+
+        if (fs_event) {
+            try browser.refresh(null);
+            full_redraw = true;
+        }
+
+        if (full_redraw or key_pressed or fs_event or config_event or blink_event) {
             try ui.render(app_tui_ptr.*, browser, config, full_redraw);
             try app_tui_ptr.*.flush();
             full_redraw = false;
         }
-    }
-}
-
-fn watchConfig(reload_requested: *std.atomic.Value(bool)) !void {
-    const home = std.posix.getenv("HOME") orelse return;
-    var path_buf: [4096]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&path_buf);
-    const config_dir = std.fs.path.join(fba.allocator(), &.{ home, ".config", "direx" }) catch return;
-    const fd = std.posix.inotify_init1(std.os.linux.IN.CLOEXEC) catch return;
-    defer std.posix.close(fd);
-    _ = std.posix.inotify_add_watch(fd, config_dir, std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE) catch return;
-    var buf: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
-    while (true) {
-        const bytes_read = std.posix.read(fd, &buf) catch break;
-        if (bytes_read == 0) break;
-        reload_requested.store(true, .monotonic);
     }
 }

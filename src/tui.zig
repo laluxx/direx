@@ -55,6 +55,8 @@ pub const Key = enum(u32) {
     esc = 27,
     backspace = 127,
     ctrl_c = 3,
+    g = 'g',
+    G = 'G',
     _,
 };
 

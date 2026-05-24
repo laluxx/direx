@@ -5,15 +5,11 @@ const Browser   = @import("browser.zig").Browser;
 const FileEntry = @import("browser.zig").FileEntry;
 const builtin   = @import("builtin");
 
-var frame_count: usize = 0;
-var total_frame_time: i64 = 0;
-
 pub fn render(app_tui: *tui.Tui, browser: *Browser, config: *Config, full: bool) !void {
-    const start_time = if (builtin.mode == .Debug) std.time.Instant.now() catch null else null;
     const size = struct { w: u16, h: u16 }{ .w = app_tui.width, .h = app_tui.height };
     
-    // Viewport height (leaving space for heading and debug stats)
-    const viewport_h = size.h - 2;
+    // Viewport height (leaving space for heading)
+    const viewport_h = if (size.h > 1) size.h - 1 else 0;
     
     // Manage scrolling before any rendering
     const scroll_changed = browser.manageScroll(viewport_h);
@@ -40,19 +36,6 @@ pub fn render(app_tui: *tui.Tui, browser: *Browser, config: *Config, full: bool)
         const curr = browser.selected_index;
         const y = @as(u16, @intCast(curr - browser.scroll_offset + 1));
         try renderEntry(app_tui, browser, &browser.entries.items[curr], curr, config, y);
-    }
-
-    if (builtin.mode == .Debug) {
-        if (start_time) |st| {
-            const end_time = std.time.Instant.now() catch return;
-            const diff = end_time.since(st);
-            frame_count += 1;
-            total_frame_time += @as(i64, @intCast(diff));
-            var stats_buf: [128]u8 = undefined;
-            const mode_str = if (browser.is_editing) "INSERT" else "NORMAL";
-            const stats_text = try std.fmt.bufPrint(&stats_buf, "Frame: {d}ns | Avg: {d}ns | Mode: {s} | Scroll: {d} | Char: {d}", .{ diff, @divTrunc(total_frame_time, @as(i64, @intCast(frame_count))), mode_str, browser.scroll_offset, browser.char_offset });
-            app_tui.writeString(0, size.h - 1, stats_text, .{ .fg = tui.Color.fromRgb(255, 255, 255), .bg = tui.Color.fromRgb(50, 50, 50) });
-        }
     }
 }
 
@@ -162,7 +145,7 @@ fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize
         var cur_cp_idx: usize = 0;
         
         while (iter.nextCodepoint()) |cp| {
-            if (cur_cp_idx == browser.char_offset) {
+            if (cur_cp_idx == browser.char_offset and browser.is_cursor_visible) {
                 app_tui.setCell(x, y, cp, .{ .fg = name_style.fg, .reversed = true });
             } else {
                 app_tui.setCell(x, y, cp, name_style);
@@ -172,8 +155,11 @@ fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize
         }
         
         // Handle cursor at the end
-        if (browser.char_offset == name_count) {
+        if (browser.char_offset == name_count and browser.is_cursor_visible) {
             app_tui.setCell(x, y, ' ', .{ .fg = name_style.fg, .reversed = true });
+            x += 1;
+        } else if (browser.char_offset == name_count) {
+            app_tui.setCell(x, y, ' ', name_style);
             x += 1;
         }
     } else {

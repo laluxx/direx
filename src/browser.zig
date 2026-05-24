@@ -40,11 +40,17 @@ pub const Browser = struct {
     // Editing state
     is_editing:     bool = false,
     edit_buffer:    std.ArrayList(u8),
+    is_cursor_visible: bool = true,
 
     // Path -> Selected Index history
     cursor_history: std.StringHashMap(usize),
     // Full Path -> Expanded state
     expansion_history: std.StringHashMap(void),
+    
+    // Inotify management
+    inotify_fd:     i32 = -1,
+    cwd_wd:         i32 = -1,
+    config_wd:      i32 = -1,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !*Browser {
         const browser = try allocator.create(Browser);
@@ -56,11 +62,27 @@ pub const Browser = struct {
             .cursor_history = std.StringHashMap(usize).init(allocator),
             .expansion_history = std.StringHashMap(void).init(allocator),
         };
+        
+        // Setup inotify
+        browser.inotify_fd = try std.posix.inotify_init1(std.os.linux.IN.CLOEXEC | std.os.linux.IN.NONBLOCK);
+        
+        // Watch config
+        if (std.posix.getenv("HOME")) |home| {
+            var path_buf: [4096]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&path_buf);
+            const config_dir = std.fs.path.join(fba.allocator(), &.{ home, ".config", "direx" }) catch null;
+            if (config_dir) |dir| {
+                browser.config_wd = std.posix.inotify_add_watch(browser.inotify_fd, dir, std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE) catch -1;
+            }
+        }
+        
+        try browser.updateCwdWatch();
         try browser.refresh(null);
         return browser;
     }
 
     pub fn deinit(self: *Browser) void {
+        if (self.inotify_fd != -1) std.posix.close(self.inotify_fd);
         self.allocator.free(self.path);
         for (self.entries.items) |*entry| {
             entry.deinit();
@@ -83,6 +105,14 @@ pub const Browser = struct {
         self.allocator.destroy(self);
     }
 
+    fn updateCwdWatch(self: *Browser) !void {
+        if (self.cwd_wd != -1) {
+            std.posix.inotify_rm_watch(self.inotify_fd, self.cwd_wd);
+        }
+        self.cwd_wd = try std.posix.inotify_add_watch(self.inotify_fd, self.path, 
+            std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE | std.os.linux.IN.DELETE | std.os.linux.IN.MOVED_FROM | std.os.linux.IN.MOVED_TO);
+    }
+
     fn statNoFollow(dir: std.fs.Dir, io: std.Io, sub_path: []const u8) !std.fs.File.Stat {
         return std.Io.Dir.statPath(.{ .handle = dir.fd }, io, sub_path, .{ .follow_symlinks = false });
     }
@@ -90,7 +120,6 @@ pub const Browser = struct {
     pub fn refresh(self: *Browser, target_entry_name: ?[]const u8) !void {
         for (self.entries.items) |*entry| entry.deinit();
         self.entries.clearRetainingCapacity();
-        self.max_size_len = 1;
         self.prev_index = null;
         self.char_offset = 0;
 
@@ -209,10 +238,8 @@ pub const Browser = struct {
         const year_day = epoch_day.calculateYearDay();
         const month_day = year_day.calculateMonthDay();
         const day_secs = epoch_secs.getDaySeconds();
-        
         const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
         const month = month_names[month_day.month.numeric() - 1];
-        
         var buf: [12]u8 = undefined;
         _ = std.fmt.bufPrint(&buf, "{s} {d:>2} {d:0>2}:{d:0>2}", .{ 
             month, 
@@ -249,6 +276,22 @@ pub const Browser = struct {
         if (self.entries.items.len == 0) return;
         self.prev_index = self.selected_index;
         self.selected_index = if (self.selected_index == self.entries.items.len - 1) 0 else self.selected_index + 1;
+        self.char_offset = 0;
+        self.saveCurrentIndex() catch {};
+    }
+    
+    pub fn moveTop(self: *Browser) void {
+        if (self.entries.items.len == 0) return;
+        self.prev_index = self.selected_index;
+        self.selected_index = 0;
+        self.char_offset = 0;
+        self.saveCurrentIndex() catch {};
+    }
+
+    pub fn moveBottom(self: *Browser) void {
+        if (self.entries.items.len == 0) return;
+        self.prev_index = self.selected_index;
+        self.selected_index = self.entries.items.len - 1;
         self.char_offset = 0;
         self.saveCurrentIndex() catch {};
     }
@@ -366,6 +409,7 @@ pub const Browser = struct {
         self.allocator.free(self.path);
         self.path = new_path;
         self.max_size_len = 1;
+        try self.updateCwdWatch();
         try self.refresh(exited_name);
     }
 
@@ -462,6 +506,7 @@ pub const Browser = struct {
             self.allocator.free(self.path);
             self.path = try self.allocator.dupe(u8, entry.full_path);
             self.max_size_len = 1;
+            try self.updateCwdWatch();
             try self.refresh(null);
             return .none;
         } else {
