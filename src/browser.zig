@@ -16,6 +16,7 @@ pub const FileEntry = struct {
     icon:         []const u8 = "",
     perm_str:     [10]u8 = undefined,
     size_str:     []const u8 = "",
+    date_str:     [12]u8 = undefined,
     
     allocator:    std.mem.Allocator,
 
@@ -82,24 +83,26 @@ pub const Browser = struct {
         self.allocator.destroy(self);
     }
 
-    fn statNoFollow(dir: std.fs.Dir, sub_path: []const u8) !std.fs.File.Stat {
-        var threaded: std.Io.Threaded = .init_single_threaded;
-        const io = threaded.ioBasic();
+    fn statNoFollow(dir: std.fs.Dir, io: std.Io, sub_path: []const u8) !std.fs.File.Stat {
         return std.Io.Dir.statPath(.{ .handle = dir.fd }, io, sub_path, .{ .follow_symlinks = false });
     }
 
     pub fn refresh(self: *Browser, target_entry_name: ?[]const u8) !void {
         for (self.entries.items) |*entry| entry.deinit();
         self.entries.clearRetainingCapacity();
+        self.max_size_len = 1;
         self.prev_index = null;
         self.char_offset = 0;
 
         var dir = std.fs.cwd().openDir(self.path, .{ .iterate = true }) catch return;
         defer dir.close();
 
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        const io = threaded.ioBasic();
+
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
-            const stat = statNoFollow(dir, entry.name) catch continue;
+            const stat = statNoFollow(dir, io, entry.name) catch continue;
             const full_path = try std.fs.path.join(self.allocator, &.{ self.path, entry.name });
             
             var fe = FileEntry{
@@ -114,6 +117,7 @@ pub const Browser = struct {
             };
             
             fe.perm_str = formatPermissions(fe.mode, fe.is_dir);
+            fe.date_str = formatDate(fe.mtime);
             var buf: [32]u8 = undefined;
             const s = try std.fmt.bufPrint(&buf, "{d}", .{stat.size});
             fe.size_str = try self.allocator.dupe(u8, s);
@@ -129,7 +133,7 @@ pub const Browser = struct {
         while (i < self.entries.items.len) {
             const entry = &self.entries.items[i];
             if (entry.is_dir and self.expansion_history.contains(entry.full_path)) {
-                try self.expandEntryAtIndex(i);
+                try self.expandEntryAtIndex(io, i);
             }
             i += 1;
         }
@@ -154,7 +158,6 @@ pub const Browser = struct {
             }
         }
         
-        // Sync history immediately after refresh
         try self.saveCurrentIndex();
     }
 
@@ -172,7 +175,6 @@ pub const Browser = struct {
         const old_offset = self.scroll_offset;
 
         if (self.selected_index < self.scroll_offset or self.selected_index >= self.scroll_offset + h) {
-            // Emacs style: Center the cursor
             if (self.selected_index < h / 2) {
                 self.scroll_offset = 0;
             } else {
@@ -180,7 +182,6 @@ pub const Browser = struct {
             }
         }
 
-        // Clamp scroll offset
         if (self.entries.items.len <= h) {
             self.scroll_offset = 0;
         } else if (self.scroll_offset + h > self.entries.items.len) {
@@ -201,11 +202,32 @@ pub const Browser = struct {
         return buf;
     }
 
+    fn formatDate(mtime_ns: i128) [12]u8 {
+        const seconds = @as(u64, @intCast(@divTrunc(mtime_ns, std.time.ns_per_s)));
+        const epoch_secs = std.time.epoch.EpochSeconds{ .secs = seconds };
+        const epoch_day = epoch_secs.getEpochDay();
+        const year_day = epoch_day.calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+        const day_secs = epoch_secs.getDaySeconds();
+        
+        const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+        const month = month_names[month_day.month.numeric() - 1];
+        
+        var buf: [12]u8 = undefined;
+        _ = std.fmt.bufPrint(&buf, "{s} {d:>2} {d:0>2}:{d:0>2}", .{ 
+            month, 
+            month_day.day_index + 1, 
+            day_secs.getHoursIntoDay(), 
+            day_secs.getMinutesIntoHour() 
+        }) catch {
+            @memset(&buf, ' ');
+        };
+        return buf;
+    }
+
     fn sortEntries(_: void, a: FileEntry, b: FileEntry) bool {
-        // Emacs dired style: alphabetical, case-insensitive, ignore leading dots
         const name_a = if (a.name.len > 0 and a.name[0] == '.') a.name[1..] else a.name;
         const name_b = if (b.name.len > 0 and b.name[0] == '.') b.name[1..] else b.name;
-
         const len = @min(name_a.len, name_b.len);
         for (0..len) |i| {
             const ca = std.ascii.toLower(name_a[i]);
@@ -284,7 +306,6 @@ pub const Browser = struct {
 
         try std.fs.renameAbsolute(entry.full_path, new_full_path);
         
-        // Update history if it's an expanded directory
         if (entry.is_dir and self.expansion_history.contains(entry.full_path)) {
             if (self.expansion_history.fetchRemove(entry.full_path)) |old| {
                 self.allocator.free(old.key);
@@ -292,7 +313,6 @@ pub const Browser = struct {
             try self.expansion_history.put(try self.allocator.dupe(u8, new_full_path), {});
         }
 
-        // We need to refresh to get updated stats and names
         const target_name = try self.allocator.dupe(u8, new_name);
         defer self.allocator.free(target_name);
         try self.refresh(target_name);
@@ -373,26 +393,29 @@ pub const Browser = struct {
             if (try self.expansion_history.fetchPut(path_key, {})) |old| {
                 self.allocator.free(old.key);
             }
-            try self.recursiveExpand(idx);
+
+            var threaded: std.Io.Threaded = .init_single_threaded;
+            const io = threaded.ioBasic();
+            try self.recursiveExpand(io, idx);
         }
         try self.saveCurrentIndex();
     }
 
-    fn recursiveExpand(self: *Browser, start_idx: usize) !void {
-        try self.expandEntryAtIndex(start_idx);
+    fn recursiveExpand(self: *Browser, io: std.Io, start_idx: usize) !void {
+        try self.expandEntryAtIndex(io, start_idx);
         var i = start_idx + 1;
         const parent_level = self.entries.items[start_idx].level;
         while (i < self.entries.items.len) {
             const entry = &self.entries.items[i];
             if (entry.level <= parent_level) break;
             if (entry.is_dir and self.expansion_history.contains(entry.full_path)) {
-                try self.expandEntryAtIndex(i);
+                try self.expandEntryAtIndex(io, i);
             }
             i += 1;
         }
     }
 
-    fn expandEntryAtIndex(self: *Browser, idx: usize) !void {
+    fn expandEntryAtIndex(self: *Browser, io: std.Io, idx: usize) !void {
         var entry = &self.entries.items[idx];
         entry.is_expanded = true;
         const current_level = entry.level;
@@ -406,7 +429,7 @@ pub const Browser = struct {
         defer new_entries.deinit(self.allocator);
 
         while (try iter.next()) |e| {
-            const stat = statNoFollow(dir, e.name) catch continue;
+            const stat = statNoFollow(dir, io, e.name) catch continue;
             const full_path = try std.fs.path.join(self.allocator, &.{ parent_path, e.name });
             var fe = FileEntry{
                 .name        = try self.allocator.dupe(u8, e.name),
@@ -420,6 +443,7 @@ pub const Browser = struct {
                 .allocator   = self.allocator,
             };
             fe.perm_str = formatPermissions(fe.mode, fe.is_dir);
+            fe.date_str = formatDate(fe.mtime);
             var buf: [32]u8 = undefined;
             const s = try std.fmt.bufPrint(&buf, "{d}", .{stat.size});
             fe.size_str = try self.allocator.dupe(u8, s);

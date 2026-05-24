@@ -102,9 +102,12 @@ fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize
     app_tui.writeString(x, y, entry.size_str, .{ .fg = config.theme.numbers, .bold = true });
     x += @as(u16, @intCast(entry.size_str.len));
 
-    const date_text = " May 23 13:22  ";
-    app_tui.writeString(x, y, date_text, .{ .fg = config.theme.datetime, .bold = true });
-    x += @as(u16, @intCast(date_text.len));
+    app_tui.writeString(x, y, " ", base_style);
+    x += 1;
+    app_tui.writeString(x, y, &entry.date_str, .{ .fg = config.theme.datetime, .bold = true });
+    x += @as(u16, @intCast(entry.date_str.len));
+    app_tui.writeString(x, y, "  ", base_style);
+    x += 2;
 
     // Tree visuals
     if (entry.level > 0) {
@@ -170,7 +173,7 @@ fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize
         
         // Handle cursor at the end
         if (browser.char_offset == name_count) {
-            app_tui.setCell(x, y, ' ', .{ .reversed = true });
+            app_tui.setCell(x, y, ' ', .{ .fg = name_style.fg, .reversed = true });
             x += 1;
         }
     } else {

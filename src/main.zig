@@ -12,9 +12,10 @@ pub fn main() !void {
     var config = try Config.load(allocator);
     defer config.deinit();
 
-    const cwd = try std.process.getCwdAlloc(allocator);
-    defer allocator.free(cwd);
-    var browser = try Browser.init(allocator, cwd);
+    const initial_cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(initial_cwd);
+    
+    var browser = try Browser.init(allocator, initial_cwd);
     defer browser.deinit();
 
     var app_tui = try tui.Tui.init(allocator);
@@ -30,7 +31,44 @@ pub fn main() !void {
         return err;
     };
     
+    const final_path = try allocator.dupe(u8, browser.path);
+    defer allocator.free(final_path);
+
     app_tui.deinit();
+
+    // 4. If the directory changed, replace process with shell
+    if (!std.mem.eql(u8, final_path, initial_cwd)) {
+        const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
+        const shell_z = try allocator.dupeZ(u8, shell);
+        defer allocator.free(shell_z);
+
+        const argv = &[_:null]?[*:0]const u8{ shell_z.ptr, null };
+
+        // Re-construct environment
+        var env = try std.process.getEnvMap(allocator);
+        defer env.deinit();
+        
+        var env_list = try std.ArrayList(?[*:0]const u8).initCapacity(allocator, env.count() + 1);
+        defer {
+            for (env_list.items) |line| {
+                if (line) |ptr| allocator.free(std.mem.span(ptr));
+            }
+            env_list.deinit(allocator);
+        }
+
+        var env_ptr = env.iterator();
+        while (env_ptr.next()) |entry| {
+            const line = try std.fmt.allocPrint(allocator, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
+            defer allocator.free(line);
+            const line_z = try allocator.dupeZ(u8, line);
+            try env_list.append(allocator, line_z.ptr);
+        }
+        try env_list.append(allocator, null);
+
+        std.posix.chdir(final_path) catch {};
+        const envp: [*:null]const ?[*:0]const u8 = @ptrCast(env_list.items.ptr);
+        _ = std.posix.execvpeZ(shell_z, argv.ptr, envp) catch {};
+    }
 }
 
 fn run(allocator: std.mem.Allocator, config: *Config, browser: *Browser, app_tui_ptr: **tui.Tui, reload_requested: *std.atomic.Value(bool)) !void {

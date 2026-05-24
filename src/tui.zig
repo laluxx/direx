@@ -63,10 +63,10 @@ pub const Tui = struct {
     stdin: std.fs.File,
     original_termios: std.posix.termios,
     allocator: std.mem.Allocator,
-    
+
     width: u16 = 0,
     height: u16 = 0,
-    
+
     back_buffer: []Cell = &.{},
     front_buffer: []Cell = &.{},
 
@@ -92,7 +92,7 @@ pub const Tui = struct {
 
         try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
         try tui.stdout.writeAll("\x1b[?1049h\x1b[?25l"); // Alt screen, hide cursor
-        
+
         try tui.resize();
 
         return tui;
@@ -111,16 +111,16 @@ pub const Tui = struct {
         if (std.posix.system.ioctl(self.stdout.handle, std.posix.T.IOCGWINSZ, @intFromPtr(&size)) != 0) {
             size = .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
         }
-        
+
         if (size.row == self.height and size.col == self.width) return;
-        
+
         self.width = size.col;
         self.height = size.row;
-        
+
         const new_len = @as(usize, self.width) * @as(usize, self.height);
         self.back_buffer = try self.allocator.realloc(self.back_buffer, new_len);
         self.front_buffer = try self.allocator.realloc(self.front_buffer, new_len);
-        
+
         @memset(self.back_buffer, Cell{});
         @memset(self.front_buffer, Cell{ .char = 0 }); // Force redraw
     }
@@ -162,7 +162,7 @@ pub const Tui = struct {
                     if (cursor_x != x or cursor_y != y) {
                         try w.interface.print("\x1b[{d};{d}H", .{ y + 1, x + 1 });
                     }
-                    
+
                     if (!back.style.eql(current_style)) {
                         try w.interface.writeAll("\x1b[0m");
                         if (back.style.fg) |fg| try w.interface.print("\x1b[38;2;{d};{d};{d}m", .{ fg.r, fg.g, fg.b });
@@ -175,7 +175,7 @@ pub const Tui = struct {
                     var buf: [4]u8 = undefined;
                     const len = try std.unicode.utf8Encode(back.char, &buf);
                     try w.interface.writeAll(buf[0..len]);
-                    
+
                     self.front_buffer[idx] = back;
                     cursor_x = @as(u16, @intCast(x)) + 1;
                     cursor_y = @as(u16, @intCast(y));
