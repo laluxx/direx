@@ -8,8 +8,9 @@ const builtin   = @import("builtin");
 pub fn render(app_tui: *tui.Tui, browser: *Browser, config: *Config, full: bool) !void {
     const size = struct { w: u16, h: u16 }{ .w = app_tui.width, .h = app_tui.height };
     
-    // Viewport height (leaving space for heading)
-    const viewport_h = if (size.h > 1) size.h - 1 else 0;
+    // Viewport height (leaving space for heading, and potentially the prompt/error at the bottom)
+    const has_bottom_bar = browser.prompt_mode != .none or browser.error_message != null;
+    const viewport_h = if (size.h > (if (has_bottom_bar) @as(u16, 2) else @as(u16, 1))) size.h - (if (has_bottom_bar) @as(u16, 2) else @as(u16, 1)) else 0;
     
     // Manage scrolling before any rendering
     const scroll_changed = browser.manageScroll(viewport_h);
@@ -34,13 +35,55 @@ pub fn render(app_tui: *tui.Tui, browser: *Browser, config: *Config, full: bool)
             }
         }
         const curr = browser.selected_index;
-        const y = @as(u16, @intCast(curr - browser.scroll_offset + 1));
-        try renderEntry(app_tui, browser, &browser.entries.items[curr], curr, config, y);
+        if (curr >= browser.scroll_offset and curr < browser.scroll_offset + viewport_h) {
+            const y = @as(u16, @intCast(curr - browser.scroll_offset + 1));
+            try renderEntry(app_tui, browser, &browser.entries.items[curr], curr, config, y);
+        }
+    }
+
+    // Render Bottom Bar (Prompt or Error)
+    if (has_bottom_bar) {
+        const py = size.h - 1;
+        // Clear bottom line
+        var clr_x: u16 = 0;
+        while (clr_x < size.w) : (clr_x += 1) app_tui.setCell(clr_x, py, ' ', .{});
+        
+        if (browser.error_message) |msg| {
+            app_tui.writeString(0, py, "Error: ", .{ .fg = config.theme.default_fg, .bold = true });
+            app_tui.writeString(7, py, msg, .{ .fg = config.theme.error_fg, .bold = true });
+        } else {
+            const prompt_str = switch (browser.prompt_mode) {
+                .create_file => "Create file: ",
+                .create_dir => "Create directory: ",
+                else => unreachable,
+            };
+            app_tui.writeString(0, py, prompt_str, .{ .fg = config.theme.heading, .bold = true });
+            
+            var x = @as(u16, @intCast(prompt_str.len));
+            const buf_items = browser.prompt_buffer.items;
+            const buf_count = std.unicode.utf8CountCodepoints(buf_items) catch 0;
+            
+            var iter = (std.unicode.Utf8View.init(buf_items) catch unreachable).iterator();
+            var cur_cp_idx: usize = 0;
+            while (iter.nextCodepoint()) |cp| {
+                if (cur_cp_idx == browser.char_offset and browser.is_cursor_visible) {
+                    app_tui.setCell(x, py, cp, .{ .fg = config.theme.default_fg, .reversed = true });
+                } else {
+                    app_tui.setCell(x, py, cp, .{ .fg = config.theme.default_fg });
+                }
+                x += 1;
+                cur_cp_idx += 1;
+            }
+            
+            if (browser.char_offset == buf_count and browser.is_cursor_visible) {
+                app_tui.setCell(x, py, ' ', .{ .reversed = true });
+            }
+        }
     }
 }
 
 fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize, config: *Config, y: u16) !void {
-    const is_selected = (i == browser.selected_index);
+    const is_selected = (i == browser.selected_index) and (browser.prompt_mode == .none) and (browser.error_message == null);
     const base_style = tui.Style{ .fg = config.theme.default_fg };
 
     var x: u16 = 2;
@@ -129,14 +172,22 @@ fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize
         x += 2;
     }
 
-    // Icon (Cached lookup)
-    if (entry.icon.len == 0) entry.icon = getIcon(entry.*, config);
-    app_tui.writeString(x, y, entry.icon, .{ .fg = if (entry.is_dir) config.theme.directories else config.theme.default_fg });
-    x += @as(u16, @intCast(try std.unicode.utf8CountCodepoints(entry.icon)));
+    // Icon
+    const icon_info = getIconInfo(entry.*, config);
+    const icon_color = icon_info.color orelse (if (entry.is_dir) config.theme.directories else config.theme.default_fg);
+    app_tui.writeString(x, y, icon_info.char, .{ .fg = icon_color });
+    x += @as(u16, @intCast(std.unicode.utf8CountCodepoints(icon_info.char) catch 1));
     app_tui.writeString(x, y, "  ", base_style);
     x += 2;
 
-    const name_style = if (entry.is_dir) tui.Style{ .fg = config.theme.directories } else tui.Style{ .fg = config.theme.default_fg };
+    const name_color = if (entry.is_dir) 
+        config.theme.directories 
+    else if ((entry.mode & 0o111) != 0) 
+        config.theme.exec_fg 
+    else 
+        config.theme.default_fg;
+
+    const name_style = tui.Style{ .fg = name_color };
     const name_to_render = if (is_selected and browser.is_editing) browser.edit_buffer.items else entry.name;
     const name_count = std.unicode.utf8CountCodepoints(name_to_render) catch 0;
 
@@ -171,8 +222,18 @@ fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize
     while (x < app_tui.width) : (x += 1) app_tui.setCell(x, y, ' ', base_style);
 }
 
-fn getIcon(entry: FileEntry, config: *Config) []const u8 {
-    if (entry.is_dir) return config.icons.get("directory") orelse "";
+fn getIconInfo(entry: FileEntry, config: *Config) @import("config.zig").IconInfo {
+    if (entry.is_dir) return config.icons.get("directory") orelse .{ .char = "" };
+    
+    // 1. Try full name match (handles .gitignore, LICENSE, etc)
+    if (config.icons.get(entry.name)) |info| return info;
+    
+    // 2. Try extension match
     const ext = std.fs.path.extension(entry.name);
-    return config.icons.get(ext) orelse config.icons.get("default") orelse "";
+    if (ext.len > 0) {
+        if (config.icons.get(ext)) |info| return info;
+    }
+    
+    // 3. Fallback to default
+    return config.icons.get("default") orelse .{ .char = "" };
 }

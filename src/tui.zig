@@ -49,7 +49,10 @@ pub const Key = enum(u32) {
     ctrl_a = 1,
     ctrl_e = 5,
     ctrl_d = 4,
+    ctrl_k = 11,
+    ctrl_y = 25,
     ctrl_g = 7,
+    meta_d = 0x2001,
     ret = 13,
     tab = 9,
     esc = 27,
@@ -193,13 +196,18 @@ pub const Tui = struct {
         var buf: [16]u8 = undefined;
         const n = try self.stdin.read(&buf);
         if (n == 0) return null;
-        if (buf[0] == 0x1b and n > 1) {
-            if (buf[1] == '[') {
-                if (buf[2] == 'A') return @intFromEnum(Key.up);
-                if (buf[2] == 'B') return @intFromEnum(Key.down);
-                if (buf[2] == 'C') return @intFromEnum(Key.right);
-                if (buf[2] == 'D') return @intFromEnum(Key.left);
+        if (buf[0] == 0x1b) {
+            if (n > 1) {
+                if (buf[1] == '[') {
+                    if (buf[2] == 'A') return @intFromEnum(Key.up);
+                    if (buf[2] == 'B') return @intFromEnum(Key.down);
+                    if (buf[2] == 'C') return @intFromEnum(Key.right);
+                    if (buf[2] == 'D') return @intFromEnum(Key.left);
+                } else if (buf[1] == 'd') {
+                    return @intFromEnum(Key.meta_d);
+                }
             }
+            return @intFromEnum(Key.esc);
         }
         return buf[0];
     }

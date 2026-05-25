@@ -11,15 +11,31 @@ Navigation is keyboard-driven and file opening hands off to `$EDITOR`.
 
 ## Keys
 
-| Key             | Action                 |
-|-----------------|------------------------|
-| `j` `n`  `C-n`  | move down              |
-| `k` `p`  `C-p`  | move up                |
-| `l` `Enter`     | open directory or file |
-| `h`             | go up a directory      |
-| `q` `Esc` `C-c` | quit                   |
+| Key            | Action                 |
+|----------------|------------------------|
+| `j` `n`  `C-n` | Move down              |
+| `k` `p`  `C-p` | Move up                |
+| `l` `Enter`    | Open directory or file |
+| `h`            | Go up a directory      |
+| `g` `M-<`      | Top                    |
+| `G` `M->`      | Bottom                 |
+| `M-d`          | Kill word              |
+| `C-d`          | Delete char            |
+| `C-k`          | Kill line              |
+| `C-y`          | Yank                   |
+| `i`            | Insert mode            |
+| `ESC` `C-g`    | Normal mode            |
+| `f`            | Create file            |
+| `+`            | Create directory       |
+| `d`            | Mark for deletion      |
+| `x`            | Execute deletions      |
+| `q`            | quit                   |
 
-Navigation wraps at both ends.
+If you are coming from emacs, I also recommend adding this keybind to your bashrc
+
+```shell
+bind -x '"\C-x\C-j": direx'
+```
 
 ## Configuration
 
@@ -47,6 +63,8 @@ icons:
 Any file extension can be mapped to any Nerd Fonts glyph.
 
 ## Building
+
+Build with `zig version` 0.16.0-dev.1456+16fc083f2
 
 ```sh
 zig build

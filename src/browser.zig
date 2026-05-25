@@ -13,7 +13,6 @@ pub const FileEntry = struct {
     mtime:        i128,
     
     // Cached render data
-    icon:         []const u8 = "",
     perm_str:     [10]u8 = undefined,
     size_str:     []const u8 = "",
     date_str:     [12]u8 = undefined,
@@ -25,6 +24,12 @@ pub const FileEntry = struct {
         self.allocator.free(self.full_path);
         if (self.size_str.len > 0) self.allocator.free(self.size_str);
     }
+};
+
+pub const PromptMode = enum {
+    none,
+    create_file,
+    create_dir,
 };
 
 pub const Browser = struct {
@@ -41,6 +46,15 @@ pub const Browser = struct {
     is_editing:     bool = false,
     edit_buffer:    std.ArrayList(u8),
     is_cursor_visible: bool = true,
+    kill_ring:      std.ArrayList(u8),
+
+    // Prompt state
+    prompt_mode:    PromptMode = .none,
+    prompt_buffer:  std.ArrayList(u8),
+    prompt_parent_path: ?[]const u8 = null,
+
+    // Error state
+    error_message:  ?[]const u8 = null,
 
     // Path -> Selected Index history
     cursor_history: std.StringHashMap(usize),
@@ -59,20 +73,24 @@ pub const Browser = struct {
             .entries = try std.ArrayList(FileEntry).initCapacity(allocator, 64),
             .allocator = allocator,
             .edit_buffer = try std.ArrayList(u8).initCapacity(allocator, 64),
+            .kill_ring = try std.ArrayList(u8).initCapacity(allocator, 64),
+            .prompt_buffer = try std.ArrayList(u8).initCapacity(allocator, 64),
             .cursor_history = std.StringHashMap(usize).init(allocator),
             .expansion_history = std.StringHashMap(void).init(allocator),
         };
         
         // Setup inotify
-        browser.inotify_fd = try std.posix.inotify_init1(std.os.linux.IN.CLOEXEC | std.os.linux.IN.NONBLOCK);
+        browser.inotify_fd = std.posix.inotify_init1(std.os.linux.IN.CLOEXEC | std.os.linux.IN.NONBLOCK) catch -1;
         
         // Watch config
         if (std.posix.getenv("HOME")) |home| {
-            var path_buf: [4096]u8 = undefined;
-            var fba = std.heap.FixedBufferAllocator.init(&path_buf);
+            var p_buf: [4096]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&p_buf);
             const config_dir = std.fs.path.join(fba.allocator(), &.{ home, ".config", "direx" }) catch null;
             if (config_dir) |dir| {
-                browser.config_wd = std.posix.inotify_add_watch(browser.inotify_fd, dir, std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE) catch -1;
+                if (browser.inotify_fd != -1) {
+                    browser.config_wd = std.posix.inotify_add_watch(browser.inotify_fd, dir, std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE) catch -1;
+                }
             }
         }
         
@@ -89,6 +107,10 @@ pub const Browser = struct {
         }
         self.entries.deinit(self.allocator);
         self.edit_buffer.deinit(self.allocator);
+        self.kill_ring.deinit(self.allocator);
+        self.prompt_buffer.deinit(self.allocator);
+        if (self.prompt_parent_path) |p| self.allocator.free(p);
+        if (self.error_message) |msg| self.allocator.free(msg);
         
         var c_iter = self.cursor_history.iterator();
         while (c_iter.next()) |entry| {
@@ -106,22 +128,35 @@ pub const Browser = struct {
     }
 
     fn updateCwdWatch(self: *Browser) !void {
+        if (self.inotify_fd == -1) return;
         if (self.cwd_wd != -1) {
             std.posix.inotify_rm_watch(self.inotify_fd, self.cwd_wd);
         }
-        self.cwd_wd = try std.posix.inotify_add_watch(self.inotify_fd, self.path, 
-            std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE | std.os.linux.IN.DELETE | std.os.linux.IN.MOVED_FROM | std.os.linux.IN.MOVED_TO);
+        self.cwd_wd = std.posix.inotify_add_watch(self.inotify_fd, self.path, 
+            std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE | std.os.linux.IN.DELETE | std.os.linux.IN.MOVED_FROM | std.os.linux.IN.MOVED_TO) catch -1;
     }
 
     fn statNoFollow(dir: std.fs.Dir, io: std.Io, sub_path: []const u8) !std.fs.File.Stat {
         return std.Io.Dir.statPath(.{ .handle = dir.fd }, io, sub_path, .{ .follow_symlinks = false });
     }
 
-    pub fn refresh(self: *Browser, target_entry_name: ?[]const u8) !void {
+    pub fn setError(self: *Browser, msg: []const u8) void {
+        if (self.error_message) |old| self.allocator.free(old);
+        self.error_message = self.allocator.dupe(u8, msg) catch null;
+    }
+
+    pub fn clearError(self: *Browser) void {
+        if (self.error_message) |msg| {
+            self.allocator.free(msg);
+            self.error_message = null;
+        }
+    }
+
+    pub fn refresh(self: *Browser, target_full_path: ?[]const u8) !void {
         for (self.entries.items) |*entry| entry.deinit();
         self.entries.clearRetainingCapacity();
         self.prev_index = null;
-        self.char_offset = 0;
+        if (!self.is_editing and self.prompt_mode == .none) self.char_offset = 0;
 
         var dir = std.fs.cwd().openDir(self.path, .{ .iterate = true }) catch return;
         defer dir.close();
@@ -169,9 +204,9 @@ pub const Browser = struct {
 
         // Restore selection
         var found_target = false;
-        if (target_entry_name) |target| {
+        if (target_full_path) |target| {
             for (self.entries.items, 0..) |entry, idx| {
-                if (std.mem.eql(u8, entry.name, target)) {
+                if (std.mem.eql(u8, entry.full_path, target)) {
                     self.selected_index = idx;
                     found_target = true;
                     break;
@@ -238,8 +273,10 @@ pub const Browser = struct {
         const year_day = epoch_day.calculateYearDay();
         const month_day = year_day.calculateMonthDay();
         const day_secs = epoch_secs.getDaySeconds();
+        
         const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
         const month = month_names[month_day.month.numeric() - 1];
+        
         var buf: [12]u8 = undefined;
         _ = std.fmt.bufPrint(&buf, "{s} {d:>2} {d:0>2}:{d:0>2}", .{ 
             month, 
@@ -297,9 +334,8 @@ pub const Browser = struct {
     }
 
     pub fn moveCharForward(self: *Browser) void {
-        if (self.entries.items.len == 0) return;
-        const name = if (self.is_editing) self.edit_buffer.items else self.entries.items[self.selected_index].name;
-        const count = std.unicode.utf8CountCodepoints(name) catch return;
+        const buf_items = if (self.prompt_mode != .none) self.prompt_buffer.items else if (self.is_editing) self.edit_buffer.items else if (self.entries.items.len > 0) self.entries.items[self.selected_index].name else return;
+        const count = std.unicode.utf8CountCodepoints(buf_items) catch return;
         if (self.char_offset < count) {
             self.char_offset += 1;
         }
@@ -316,9 +352,8 @@ pub const Browser = struct {
     }
 
     pub fn moveLineEnd(self: *Browser) void {
-        if (self.entries.items.len == 0) return;
-        const name = if (self.is_editing) self.edit_buffer.items else self.entries.items[self.selected_index].name;
-        const count = std.unicode.utf8CountCodepoints(name) catch return;
+        const buf_items = if (self.prompt_mode != .none) self.prompt_buffer.items else if (self.is_editing) self.edit_buffer.items else if (self.entries.items.len > 0) self.entries.items[self.selected_index].name else return;
+        const count = std.unicode.utf8CountCodepoints(buf_items) catch return;
         self.char_offset = count;
     }
 
@@ -332,10 +367,59 @@ pub const Browser = struct {
     pub fn stopEditing(self: *Browser, apply: bool) !void {
         if (!self.is_editing) return;
         if (apply) {
-            try self.renameSelected(self.edit_buffer.items);
+            self.renameSelected(self.edit_buffer.items) catch |err| {
+                self.setError(@errorName(err));
+            };
         }
         self.is_editing = false;
         self.edit_buffer.clearRetainingCapacity();
+    }
+
+    pub fn startPrompt(self: *Browser, mode: PromptMode) !void {
+        self.prompt_mode = mode;
+        self.prompt_buffer.clearRetainingCapacity();
+        self.char_offset = 0;
+
+        if (self.prompt_parent_path) |p| self.allocator.free(p);
+        
+        if (self.entries.items.len > 0) {
+            const entry = self.entries.items[self.selected_index];
+            if (entry.is_dir and entry.is_expanded) {
+                self.prompt_parent_path = try self.allocator.dupe(u8, entry.full_path);
+            } else {
+                const dir = std.fs.path.dirname(entry.full_path) orelse self.path;
+                self.prompt_parent_path = try self.allocator.dupe(u8, dir);
+            }
+        } else {
+            self.prompt_parent_path = try self.allocator.dupe(u8, self.path);
+        }
+    }
+
+    pub fn stopPrompt(self: *Browser, apply: bool) !void {
+        if (self.prompt_mode == .none) return;
+        if (apply and self.prompt_buffer.items.len > 0) {
+            const name = self.prompt_buffer.items;
+            const parent = self.prompt_parent_path orelse self.path;
+            const full_path = try std.fs.path.join(self.allocator, &.{ parent, name });
+            defer self.allocator.free(full_path);
+            
+            const create_result = if (self.prompt_mode == .create_file) blk: {
+                const file = std.fs.createFileAbsolute(full_path, .{}) catch |err| break :blk err;
+                file.close();
+                break :blk {};
+            } else if (self.prompt_mode == .create_dir) blk: {
+                break :blk std.fs.makeDirAbsolute(full_path);
+            } else unreachable;
+
+            if (create_result) |_| {
+                try self.refresh(full_path);
+            } else |err| {
+                self.setError(@errorName(err));
+            }
+        }
+        self.prompt_mode = .none;
+        self.prompt_buffer.clearRetainingCapacity();
+        self.char_offset = 0;
     }
 
     pub fn renameSelected(self: *Browser, new_name: []const u8) !void {
@@ -356,61 +440,155 @@ pub const Browser = struct {
             try self.expansion_history.put(try self.allocator.dupe(u8, new_full_path), {});
         }
 
-        const target_name = try self.allocator.dupe(u8, new_name);
-        defer self.allocator.free(target_name);
-        try self.refresh(target_name);
+        try self.refresh(new_full_path);
     }
 
     pub fn deleteCharUnderCursor(self: *Browser) !void {
-        if (self.entries.items.len == 0) return;
-        if (!self.is_editing) try self.startEditing();
-        
-        var iter = (std.unicode.Utf8View.init(self.edit_buffer.items) catch return).iterator();
+        const active_buffer = if (self.prompt_mode != .none) &self.prompt_buffer else if (self.is_editing) &self.edit_buffer else null;
+        if (active_buffer == null) {
+            if (self.entries.items.len == 0) return;
+            try self.startEditing();
+            return self.deleteCharUnderCursor();
+        }
+
+        var iter = (std.unicode.Utf8View.init(active_buffer.?.items) catch return).iterator();
         var i: usize = 0;
         while (i < self.char_offset) : (i += 1) _ = iter.nextCodepoint();
         
         const start = iter.i;
         if (iter.nextCodepoint()) |_| {
             const end = iter.i;
-            self.edit_buffer.replaceRange(self.allocator, start, end - start, &.{}) catch {};
+            const deleted = active_buffer.?.items[start..end];
+            if (self.is_editing) {
+                self.kill_ring.clearRetainingCapacity();
+                try self.kill_ring.appendSlice(self.allocator, deleted);
+            }
+            active_buffer.?.replaceRange(self.allocator, start, end - start, &.{}) catch {};
         }
     }
 
     pub fn backspace(self: *Browser) !void {
-        if (self.entries.items.len == 0) return;
-        if (self.char_offset == 0) return;
-        if (!self.is_editing) try self.startEditing();
+        if (self.char_offset == 0) {
+            if (self.prompt_mode == .none and !self.is_editing and self.entries.items.len > 0) try self.startEditing();
+            return;
+        }
+        if (self.prompt_mode == .none and !self.is_editing and self.entries.items.len > 0) try self.startEditing();
 
         self.char_offset -= 1;
         try self.deleteCharUnderCursor();
     }
 
-    pub fn insertChar(self: *Browser, cp: u21) !void {
+    pub fn killLine(self: *Browser) !void {
+        if (self.entries.items.len == 0) return;
+        const name = if (self.is_editing) self.edit_buffer.items else self.entries.items[self.selected_index].name;
+        
+        var iter = (std.unicode.Utf8View.init(name) catch return).iterator();
+        var i: usize = 0;
+        while (i < self.char_offset) : (i += 1) _ = iter.nextCodepoint();
+        
+        const start = iter.i;
+        const killed = name[start..];
+        
+        if (killed.len > 0) {
+            self.kill_ring.clearRetainingCapacity();
+            try self.kill_ring.appendSlice(self.allocator, killed);
+        }
+
+        if (self.is_editing) {
+            try self.edit_buffer.resize(self.allocator, start);
+        } else {
+            self.char_offset = std.unicode.utf8CountCodepoints(name) catch self.char_offset;
+            self.kill_ring.clearRetainingCapacity();
+            try self.kill_ring.appendSlice(self.allocator, killed);
+        }
+    }
+
+    pub fn killWord(self: *Browser) !void {
         if (self.entries.items.len == 0) return;
         if (!self.is_editing) try self.startEditing();
+
+        const name = self.edit_buffer.items;
+        var iter = (std.unicode.Utf8View.init(name) catch return).iterator();
+        var i: usize = 0;
+        while (i < self.char_offset) : (i += 1) _ = iter.nextCodepoint();
+        const start = iter.i;
+
+        while (true) {
+            const prev_i = iter.i;
+            if (iter.nextCodepoint()) |cp| {
+                if (std.ascii.isAlphanumeric(@intCast(cp))) {
+                    iter.i = prev_i;
+                    break;
+                }
+            } else break;
+        }
+
+        while (true) {
+            const prev_i = iter.i;
+            if (iter.nextCodepoint()) |cp| {
+                if (!std.ascii.isAlphanumeric(@intCast(cp))) {
+                    iter.i = prev_i;
+                    break;
+                }
+            } else break;
+        }
+        
+        const end = iter.i;
+        const killed = name[start..end];
+        if (killed.len > 0) {
+            self.kill_ring.clearRetainingCapacity();
+            try self.kill_ring.appendSlice(self.allocator, killed);
+            self.edit_buffer.replaceRange(self.allocator, start, end - start, &.{}) catch {};
+        }
+    }
+
+    pub fn yank(self: *Browser) !void {
+        if (self.kill_ring.items.len == 0) return;
+        const active_buffer = if (self.prompt_mode != .none) &self.prompt_buffer else if (self.is_editing) &self.edit_buffer else null;
+        if (active_buffer == null) {
+            if (self.entries.items.len == 0) return;
+            try self.startEditing();
+            return self.yank();
+        }
+
+        var iter = (std.unicode.Utf8View.init(active_buffer.?.items) catch return).iterator();
+        var i: usize = 0;
+        while (i < self.char_offset) : (i += 1) _ = iter.nextCodepoint();
+        
+        try active_buffer.?.insertSlice(self.allocator, iter.i, self.kill_ring.items);
+        self.char_offset += std.unicode.utf8CountCodepoints(self.kill_ring.items) catch 0;
+    }
+
+    pub fn insertChar(self: *Browser, cp: u21) !void {
+        const active_buffer = if (self.prompt_mode != .none) &self.prompt_buffer else if (self.is_editing) &self.edit_buffer else null;
+        if (active_buffer == null) {
+            if (self.entries.items.len == 0) return;
+            try self.startEditing();
+            return self.insertChar(cp);
+        }
 
         var utf8_buf: [4]u8 = undefined;
         const len = try std.unicode.utf8Encode(cp, &utf8_buf);
         
-        var iter = (std.unicode.Utf8View.init(self.edit_buffer.items) catch return).iterator();
+        var iter = (std.unicode.Utf8View.init(active_buffer.?.items) catch return).iterator();
         var i: usize = 0;
         while (i < self.char_offset) : (i += 1) _ = iter.nextCodepoint();
         
-        try self.edit_buffer.insertSlice(self.allocator, iter.i, utf8_buf[0..len]);
+        try active_buffer.?.insertSlice(self.allocator, iter.i, utf8_buf[0..len]);
         self.char_offset += 1;
     }
 
     pub fn cdUp(self: *Browser) !void {
         try self.saveCurrentIndex();
-        const exited_name = try self.allocator.dupe(u8, std.fs.path.basename(self.path));
-        defer self.allocator.free(exited_name);
+        const old_path = try self.allocator.dupe(u8, self.path);
+        defer self.allocator.free(old_path);
         const parent = std.fs.path.dirname(self.path) orelse return;
         const new_path = try self.allocator.dupe(u8, parent);
         self.allocator.free(self.path);
         self.path = new_path;
         self.max_size_len = 1;
         try self.updateCwdWatch();
-        try self.refresh(exited_name);
+        try self.refresh(old_path);
     }
 
     pub fn toggleExpand(self: *Browser) !void {

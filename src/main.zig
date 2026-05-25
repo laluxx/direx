@@ -1,8 +1,8 @@
-const std = @import("std");
-const tui = @import("tui.zig");
-const Config = @import("config.zig").Config;
+const std     = @import("std");
+const tui     = @import("tui.zig");
+const Config  = @import("config.zig").Config;
 const Browser = @import("browser.zig").Browser;
-const ui = @import("ui.zig");
+const ui      = @import("ui.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -29,7 +29,7 @@ pub fn main() !void {
     // 3. Prepare Browser
     const cwd = if (initial_path) |p| try allocator.dupe(u8, p) else try std.process.getCwdAlloc(allocator);
     defer allocator.free(cwd);
-    
+
     var browser = try Browser.init(allocator, cwd);
     defer browser.deinit();
 
@@ -44,7 +44,7 @@ pub fn main() !void {
         app_tui.deinit();
         return err;
     };
-    
+
     const final_path = try allocator.dupe(u8, browser.path);
     defer allocator.free(final_path);
 
@@ -80,13 +80,13 @@ pub fn main() !void {
 
 fn run(allocator: std.mem.Allocator, config: *Config, browser: *Browser, app_tui_ptr: **tui.Tui) !void {
     var full_redraw = false;
-    
+
     var last_blink_instant = try std.time.Instant.now();
 
     while (true) {
         var timeout: i32 = -1;
-        
-        if (browser.is_editing) {
+
+        if (browser.is_editing or browser.prompt_mode != .none) {
             const now = try std.time.Instant.now();
             const blink_ms: i32 = 500;
             const elapsed_since_blink = @divTrunc(now.since(last_blink_instant), std.time.ns_per_ms);
@@ -99,13 +99,13 @@ fn run(allocator: std.mem.Allocator, config: *Config, browser: *Browser, app_tui
         };
 
         const ready = try std.posix.poll(&fds, timeout);
-        
+
         var fs_event = false;
         var config_event = false;
         var key_pressed = false;
         var blink_event = false;
 
-        if (ready == 0 and browser.is_editing) {
+        if (ready == 0 and (browser.is_editing or browser.prompt_mode != .none)) {
             blink_event = true;
             browser.is_cursor_visible = !browser.is_cursor_visible;
             last_blink_instant = try std.time.Instant.now();
@@ -113,7 +113,7 @@ fn run(allocator: std.mem.Allocator, config: *Config, browser: *Browser, app_tui
             if (fds[1].revents & std.posix.POLL.IN != 0) {
                 var buf: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
                 const n = try std.posix.read(browser.inotify_fd, &buf);
-                
+
                 var i: usize = 0;
                 while (i < n) {
                     const event: *std.os.linux.inotify_event = @ptrCast(@alignCast(&buf[i]));
@@ -129,19 +129,49 @@ fn run(allocator: std.mem.Allocator, config: *Config, browser: *Browser, app_tui
                     key_pressed = true;
                     browser.is_cursor_visible = true;
                     last_blink_instant = try std.time.Instant.now();
-                    
-                    const key: tui.Key = @enumFromInt(kr);
-                    if (key == .ctrl_c or (key == @as(tui.Key, @enumFromInt('q')) and !browser.is_editing)) break;
 
-                    if (browser.is_editing) {
+                    // Clear error on any key press
+                    if (browser.error_message != null) {
+                        browser.clearError();
+                        full_redraw = true;
+                    }
+
+                    const key: tui.Key = @enumFromInt(kr);
+                    if (key == .ctrl_c or (key == @as(tui.Key, @enumFromInt('q')) and !browser.is_editing and browser.prompt_mode == .none)) break;
+
+                    if (browser.prompt_mode != .none) {
                         switch (key) {
-                            .esc, .ctrl_g => try browser.stopEditing(true),
-                            .up, .ctrl_p => { try browser.stopEditing(true); browser.moveUp(); },
-                            .down, .ctrl_n => { try browser.stopEditing(true); browser.moveDown(); },
+                            .esc, .ctrl_g => try browser.stopPrompt(false),
+                            .ret => try browser.stopPrompt(true),
                             .left, .ctrl_b => browser.moveCharBackward(),
                             .right, .ctrl_f => browser.moveCharForward(),
                             .ctrl_a => browser.moveLineStart(),
                             .ctrl_e => browser.moveLineEnd(),
+                            .backspace => try browser.backspace(),
+                            .ctrl_d => try browser.deleteCharUnderCursor(),
+                            .ctrl_k => try browser.killLine(),
+                            .ctrl_y => try browser.yank(),
+                            else => if (kr >= 32 and kr < 0x1000) try browser.insertChar(@intCast(kr)),
+                        }
+                        full_redraw = true;
+                    } else if (browser.is_editing) {
+                        switch (key) {
+                            .esc, .ctrl_g => try browser.stopEditing(true),
+                            .up, .ctrl_p => {
+                                try browser.stopEditing(true);
+                                browser.moveUp();
+                            },
+                            .down, .ctrl_n => {
+                                try browser.stopEditing(true);
+                                browser.moveDown();
+                            },
+                            .left, .ctrl_b => browser.moveCharBackward(),
+                            .right, .ctrl_f => browser.moveCharForward(),
+                            .ctrl_a => browser.moveLineStart(),
+                            .ctrl_e => browser.moveLineEnd(),
+                            .ctrl_k => try browser.killLine(),
+                            .ctrl_y => try browser.yank(),
+                            .meta_d => try browser.killWord(),
                             .backspace => try browser.backspace(),
                             .ctrl_d => try browser.deleteCharUnderCursor(),
                             .ret => try browser.stopEditing(true),
@@ -187,12 +217,24 @@ fn run(allocator: std.mem.Allocator, config: *Config, browser: *Browser, app_tui
                             browser.moveLineEnd();
                         } else if (key == @as(tui.Key, @enumFromInt('i'))) {
                             try browser.startEditing();
+                        } else if (key == @as(tui.Key, @enumFromInt('f'))) {
+                            try browser.startPrompt(.create_file);
+                            full_redraw = true;
+                        } else if (key == @as(tui.Key, @enumFromInt('+'))) {
+                            try browser.startPrompt(.create_dir);
+                            full_redraw = true;
                         } else if (key == .backspace) {
                             try browser.startEditing();
                             try browser.backspace();
                         } else if (key == .ctrl_d) {
                             try browser.startEditing();
                             try browser.deleteCharUnderCursor();
+                        } else if (key == .ctrl_k) {
+                            try browser.killLine();
+                        } else if (key == .ctrl_y) {
+                            try browser.yank();
+                        } else if (key == .meta_d) {
+                            try browser.killWord();
                         }
                     }
                 }
@@ -201,6 +243,7 @@ fn run(allocator: std.mem.Allocator, config: *Config, browser: *Browser, app_tui
 
         if (config_event) {
             config.reload() catch {};
+            try browser.refresh(null);
             full_redraw = true;
         }
 
