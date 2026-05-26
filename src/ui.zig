@@ -84,7 +84,18 @@ pub fn render(app_tui: *tui.Tui, browser: *Browser, config: *Config, full: bool)
 
 fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize, config: *Config, y: u16) !void {
     const is_selected = (i == browser.selected_index) and (browser.prompt_mode == .none) and (browser.error_message == null);
+    const is_marked = browser.marked_for_deletion.contains(entry.full_path);
+    
     const base_style = tui.Style{ .fg = config.theme.default_fg };
+    const mark_style = tui.Style{ .fg = config.theme.error_fg, .underlined = true };
+
+    if (is_marked) {
+        app_tui.setCell(0, y, 'D', mark_style);
+        app_tui.setCell(1, y, ' ', mark_style);
+    } else {
+        app_tui.setCell(0, y, ' ', base_style);
+        app_tui.setCell(1, y, ' ', base_style);
+    }
 
     var x: u16 = 2;
 
@@ -92,15 +103,18 @@ fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize
     const p = entry.perm_str;
     const d_char = p[0];
     app_tui.setCell(x, y, d_char, .{ 
-        .fg = if (d_char == 'd') config.theme.priv_d else config.theme.priv_dash, 
-        .bold = d_char == 'd' 
+        .fg = if (is_marked) config.theme.error_fg else if (d_char == 'd') config.theme.priv_d else config.theme.priv_dash, 
+        .bold = d_char == 'd',
+        .underlined = is_marked,
     });
     x += 1;
     const p_chars = "rwxrwxrwx";
     for (0..9) |pi| {
         const char_val = p[pi+1];
-        var style = tui.Style{};
-        if (char_val != '-') {
+        var style = tui.Style{ .underlined = is_marked };
+        if (is_marked) {
+            style.fg = config.theme.error_fg;
+        } else if (char_val != '-') {
             style.fg = switch (p_chars[pi]) {
                 'r' => config.theme.priv_r,
                 'w' => config.theme.priv_w,
@@ -117,25 +131,40 @@ fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize
     // Nlink
     var nlink_buf: [16]u8 = undefined;
     const nlink_text = try std.fmt.bufPrint(&nlink_buf, " {d}", .{entry.nlink});
-    app_tui.writeString(x, y, nlink_text, .{ .fg = config.theme.numbers, .bold = true });
+    app_tui.writeString(x, y, nlink_text, .{ 
+        .fg = if (is_marked) config.theme.error_fg else config.theme.numbers, 
+        .bold = true, 
+        .underlined = is_marked 
+    });
     x += @as(u16, @intCast(nlink_text.len));
 
-    app_tui.writeString(x, y, " l l ", base_style);
+    app_tui.writeString(x, y, " l l ", .{ .fg = if (is_marked) config.theme.error_fg else base_style.fg, .underlined = is_marked });
     x += 5;
 
     // Size (Cached & Padded)
-    for (0..browser.max_size_len - entry.size_str.len) |_| { app_tui.setCell(x, y, ' ', base_style); x += 1; }
-    app_tui.writeString(x, y, entry.size_str, .{ .fg = config.theme.numbers, .bold = true });
+    for (0..browser.max_size_len - entry.size_str.len) |_| { 
+        app_tui.setCell(x, y, ' ', .{ .fg = if (is_marked) config.theme.error_fg else base_style.fg, .underlined = is_marked }); 
+        x += 1; 
+    }
+    app_tui.writeString(x, y, entry.size_str, .{ 
+        .fg = if (is_marked) config.theme.error_fg else config.theme.numbers, 
+        .bold = true, 
+        .underlined = is_marked 
+    });
     x += @as(u16, @intCast(entry.size_str.len));
 
-    app_tui.writeString(x, y, " ", base_style);
+    app_tui.writeString(x, y, " ", .{ .fg = if (is_marked) config.theme.error_fg else base_style.fg, .underlined = is_marked });
     x += 1;
-    app_tui.writeString(x, y, &entry.date_str, .{ .fg = config.theme.datetime, .bold = true });
+    app_tui.writeString(x, y, &entry.date_str, .{ 
+        .fg = if (is_marked) config.theme.error_fg else config.theme.datetime, 
+        .bold = true, 
+        .underlined = is_marked 
+    });
     x += @as(u16, @intCast(entry.date_str.len));
-    app_tui.writeString(x, y, "  ", base_style);
+    app_tui.writeString(x, y, "  ", .{ .fg = if (is_marked) config.theme.error_fg else base_style.fg, .underlined = is_marked });
     x += 2;
 
-    // Tree visuals
+    // Tree visuals (Skip mark coloring/underline as requested "excluding the tree if there is")
     if (entry.level > 0) {
         for (1..entry.level) |depth| {
             var has_more_at_depth = false;
@@ -174,20 +203,22 @@ fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize
 
     // Icon
     const icon_info = getIconInfo(entry.*, config);
-    const icon_color = icon_info.color orelse (if (entry.is_dir) config.theme.directories else config.theme.default_fg);
-    app_tui.writeString(x, y, icon_info.char, .{ .fg = icon_color });
+    const icon_color = if (is_marked) config.theme.error_fg else (icon_info.color orelse (if (entry.is_dir) config.theme.directories else config.theme.default_fg));
+    app_tui.writeString(x, y, icon_info.char, .{ .fg = icon_color, .underlined = is_marked });
     x += @as(u16, @intCast(std.unicode.utf8CountCodepoints(icon_info.char) catch 1));
-    app_tui.writeString(x, y, "  ", base_style);
+    app_tui.writeString(x, y, "  ", .{ .fg = if (is_marked) config.theme.error_fg else base_style.fg, .underlined = is_marked });
     x += 2;
 
-    const name_color = if (entry.is_dir) 
+    const name_color = if (is_marked) 
+        config.theme.error_fg 
+    else if (entry.is_dir) 
         config.theme.directories 
     else if ((entry.mode & 0o111) != 0) 
         config.theme.exec_fg 
     else 
         config.theme.default_fg;
 
-    const name_style = tui.Style{ .fg = name_color };
+    const name_style = tui.Style{ .fg = name_color, .underlined = is_marked };
     const name_to_render = if (is_selected and browser.is_editing) browser.edit_buffer.items else entry.name;
     const name_count = std.unicode.utf8CountCodepoints(name_to_render) catch 0;
 
@@ -197,7 +228,7 @@ fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize
         
         while (iter.nextCodepoint()) |cp| {
             if (cur_cp_idx == browser.char_offset and browser.is_cursor_visible) {
-                app_tui.setCell(x, y, cp, .{ .fg = name_style.fg, .reversed = true });
+                app_tui.setCell(x, y, cp, .{ .fg = name_style.fg, .reversed = true, .underlined = is_marked });
             } else {
                 app_tui.setCell(x, y, cp, name_style);
             }
@@ -207,7 +238,7 @@ fn renderEntry(app_tui: *tui.Tui, browser: *Browser, entry: *FileEntry, i: usize
         
         // Handle cursor at the end
         if (browser.char_offset == name_count and browser.is_cursor_visible) {
-            app_tui.setCell(x, y, ' ', .{ .fg = name_style.fg, .reversed = true });
+            app_tui.setCell(x, y, ' ', .{ .fg = name_style.fg, .reversed = true, .underlined = is_marked });
             x += 1;
         } else if (browser.char_offset == name_count) {
             app_tui.setCell(x, y, ' ', name_style);

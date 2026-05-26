@@ -19,11 +19,12 @@ pub const Style = struct {
     bg: ?Color = null,
     reversed: bool = false,
     bold: bool = false,
+    underlined: bool = false,
 
     pub fn eql(self: Style, other: Style) bool {
         const fg_eq = if (self.fg == null and other.fg == null) true else if (self.fg != null and other.fg != null) self.fg.?.eql(other.fg.?) else false;
         const bg_eq = if (self.bg == null and other.bg == null) true else if (self.bg != null and other.bg != null) self.bg.?.eql(other.bg.?) else false;
-        return fg_eq and bg_eq and self.reversed == other.reversed and self.bold == other.bold;
+        return fg_eq and bg_eq and self.reversed == other.reversed and self.bold == other.bold and self.underlined == other.underlined;
     }
 };
 
@@ -52,6 +53,8 @@ pub const Key = enum(u32) {
     ctrl_k = 11,
     ctrl_y = 25,
     ctrl_g = 7,
+    ctrl_slash = 31,
+    ctrl_question = 0x1005, // Custom for redo
     meta_d = 0x2001,
     ret = 13,
     tab = 9,
@@ -174,6 +177,7 @@ pub const Tui = struct {
                         if (back.style.bg) |bg| try w.interface.print("\x1b[48;2;{d};{d};{d}m", .{ bg.r, bg.g, bg.b });
                         if (back.style.reversed) try w.interface.writeAll("\x1b[7m");
                         if (back.style.bold) try w.interface.writeAll("\x1b[1m");
+                        if (back.style.underlined) try w.interface.writeAll("\x1b[4m");
                         current_style = back.style;
                     }
 
@@ -205,10 +209,13 @@ pub const Tui = struct {
                     if (buf[2] == 'D') return @intFromEnum(Key.left);
                 } else if (buf[1] == 'd') {
                     return @intFromEnum(Key.meta_d);
+                } else if (buf[1] == '?') {
+                    return @intFromEnum(Key.ctrl_question);
                 }
             }
             return @intFromEnum(Key.esc);
         }
+        if (buf[0] == 0x1f) return @intFromEnum(Key.ctrl_slash);
         return buf[0];
     }
 };

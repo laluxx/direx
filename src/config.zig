@@ -24,6 +24,7 @@ pub const IconInfo = struct {
 pub const Config = struct {
     theme: Theme,
     icons: std.StringHashMap(IconInfo),
+    trash_path: []const u8,
     allocator: std.mem.Allocator,
 
     pub fn load(allocator: std.mem.Allocator) !*Config {
@@ -31,8 +32,13 @@ pub const Config = struct {
         config.* = .{
             .theme = undefined,
             .icons = std.StringHashMap(IconInfo).init(allocator),
+            .trash_path = "",
             .allocator = allocator,
         };
+
+        // Set default trash path
+        const home = std.posix.getenv("HOME") orelse ".";
+        config.trash_path = try std.fs.path.join(allocator, &.{ home, ".config", "direx", "trash" });
 
         // Set defaults
         config.theme = .{
@@ -68,6 +74,7 @@ pub const Config = struct {
             self.allocator.free(entry.value_ptr.*.char);
         }
         self.icons.deinit();
+        self.allocator.free(self.trash_path);
         self.allocator.destroy(self);
     }
 
@@ -96,37 +103,45 @@ pub const Config = struct {
         };
         defer file.close();
 
-        try file.writeAll(
+        const default_trash = try std.fs.path.join(self.allocator, &.{ home, ".config", "direx", "trash" });
+        defer self.allocator.free(default_trash);
+
+        const config_template =
             \\theme:
             \\  directories: "#9587DD"
             \\  datetime:    "#9587DD"
             \\  numbers:     "#41b0f3"
             \\  default_fg:  "#e6e6e8"
             \\  privileges:
-            \\    d:     "#6bd9db"
-            \\    r:     "#6dd797"
-            \\    w:     "#eae46a"
-            \\    dash:  "#615B75"
-            \\    exec:  "#e84c58"
-            \\  heading: "#49bdb0"
-            \\  exec_fg: "#65E6A7"
+            \\    d:      "#6bd9db"
+            \\    r:      "#6dd797"
+            \\    w:      "#eae46a"
+            \\    dash:   "#615B75"
+            \\    exec:   "#e84c58"
+            \\  heading:  "#49bdb0"
+            \\  exec_fg:  "#65E6A7"
             \\  error_fg: "#e84c58"
+            \\
+            \\trash_path: "{s}"
+            \\
             \\icons:
-
             \\  .zig: " #FFA500"
             \\  .c:   " #6A9FB5"
             \\  .h:   " #AA759F"
             \\  .o:   " #838484"
             \\  .md:  " #e6e6e8"
+            \\  .txt: " #e6e6e8"
             \\  .org: " #C6E87A"
-            \\  .png: "󰸭 #D4843E"
             \\  .git: " #615B75"
             \\  .gitignore: " #EB595A"
             \\  directory: " #9587DD"
-            \\  default:   " #e6e6e8"
-
+            \\  default:   " #e6e6e8"
             \\
-        );
+        ;
+
+        const output = try std.fmt.allocPrint(self.allocator, config_template, .{default_trash});
+        defer self.allocator.free(output);
+        try file.writeAll(output);
     }
 
     pub fn reload(self: *Config) !void {
@@ -157,6 +172,15 @@ pub const Config = struct {
                 continue;
             } else if (std.mem.startsWith(u8, line, "icons:")) {
                 current_section = .icons;
+                continue;
+            } else if (std.mem.startsWith(u8, line, "trash_path:")) {
+                var parts = std.mem.splitScalar(u8, line, ':');
+                _ = parts.next();
+                const val = std.mem.trim(u8, parts.rest(), " \"'");
+                if (val.len > 0) {
+                    self.allocator.free(self.trash_path);
+                    self.trash_path = try self.allocator.dupe(u8, val);
+                }
                 continue;
             }
 

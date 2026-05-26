@@ -215,6 +215,21 @@ fn run(allocator: std.mem.Allocator, config: *Config, browser: *Browser, app_tui
                             browser.moveLineStart();
                         } else if (key == .ctrl_e) {
                             browser.moveLineEnd();
+                        } else if (key == @as(tui.Key, @enumFromInt('d'))) {
+                            try browser.markForDeletion();
+                            full_redraw = true;
+                        } else if (key == @as(tui.Key, @enumFromInt('u'))) {
+                            browser.unmark();
+                            full_redraw = true;
+                        } else if (key == @as(tui.Key, @enumFromInt('x'))) {
+                            try browser.executeDeletions(config.trash_path);
+                            full_redraw = true;
+                        } else if (key == .ctrl_slash) {
+                            try browser.undo();
+                            full_redraw = true;
+                        } else if (key == .ctrl_question) {
+                            try browser.redo();
+                            full_redraw = true;
                         } else if (key == @as(tui.Key, @enumFromInt('i'))) {
                             try browser.startEditing();
                         } else if (key == @as(tui.Key, @enumFromInt('f'))) {

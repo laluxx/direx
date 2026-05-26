@@ -32,6 +32,23 @@ pub const PromptMode = enum {
     create_dir,
 };
 
+pub const DeletionAction = struct {
+    original_path: []const u8,
+    trash_path: []const u8,
+};
+
+pub const HistoryEntry = struct {
+    actions: std.ArrayListUnmanaged(DeletionAction) = .{},
+
+    pub fn deinit(self: *HistoryEntry, allocator: std.mem.Allocator) void {
+        for (self.actions.items) |action| {
+            allocator.free(action.original_path);
+            allocator.free(action.trash_path);
+        }
+        self.actions.deinit(allocator);
+    }
+};
+
 pub const Browser = struct {
     path:           []const u8,
     entries:        std.ArrayList(FileEntry),
@@ -52,6 +69,13 @@ pub const Browser = struct {
     prompt_mode:    PromptMode = .none,
     prompt_buffer:  std.ArrayList(u8),
     prompt_parent_path: ?[]const u8 = null,
+
+    // Deletion marking
+    marked_for_deletion: std.StringHashMap(void),
+    
+    // History
+    undo_stack:     std.ArrayListUnmanaged(HistoryEntry) = .{},
+    redo_stack:     std.ArrayListUnmanaged(HistoryEntry) = .{},
 
     // Error state
     error_message:  ?[]const u8 = null,
@@ -75,6 +99,7 @@ pub const Browser = struct {
             .edit_buffer = try std.ArrayList(u8).initCapacity(allocator, 64),
             .kill_ring = try std.ArrayList(u8).initCapacity(allocator, 64),
             .prompt_buffer = try std.ArrayList(u8).initCapacity(allocator, 64),
+            .marked_for_deletion = std.StringHashMap(void).init(allocator),
             .cursor_history = std.StringHashMap(usize).init(allocator),
             .expansion_history = std.StringHashMap(void).init(allocator),
         };
@@ -112,6 +137,17 @@ pub const Browser = struct {
         if (self.prompt_parent_path) |p| self.allocator.free(p);
         if (self.error_message) |msg| self.allocator.free(msg);
         
+        var m_iter = self.marked_for_deletion.iterator();
+        while (m_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.marked_for_deletion.deinit();
+
+        for (self.undo_stack.items) |*entry| entry.deinit(self.allocator);
+        self.undo_stack.deinit(self.allocator);
+        for (self.redo_stack.items) |*entry| entry.deinit(self.allocator);
+        self.redo_stack.deinit(self.allocator);
+
         var c_iter = self.cursor_history.iterator();
         while (c_iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -331,6 +367,136 @@ pub const Browser = struct {
         self.selected_index = self.entries.items.len - 1;
         self.char_offset = 0;
         self.saveCurrentIndex() catch {};
+    }
+
+    pub fn markForDeletion(self: *Browser) !void {
+        if (self.entries.items.len == 0) return;
+        const entry = self.entries.items[self.selected_index];
+        if (self.marked_for_deletion.contains(entry.full_path)) {
+            self.moveDown();
+            return;
+        }
+        const path_key = try self.allocator.dupe(u8, entry.full_path);
+        try self.marked_for_deletion.put(path_key, {});
+        self.moveDown();
+    }
+
+    pub fn unmark(self: *Browser) void {
+        if (self.entries.items.len == 0) return;
+        const entry = self.entries.items[self.selected_index];
+        if (self.marked_for_deletion.fetchRemove(entry.full_path)) |old| {
+            self.allocator.free(old.key);
+        }
+        self.moveDown();
+    }
+
+    pub fn executeDeletions(self: *Browser, trash_path: []const u8) !void {
+        if (self.marked_for_deletion.count() == 0) return;
+
+        // Ensure trash directory exists
+        std.fs.makeDirAbsolute(trash_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        var history_entry = HistoryEntry{ .actions = .{} };
+
+        var iter = self.marked_for_deletion.iterator();
+        while (iter.next()) |entry| {
+            const full_path = entry.key_ptr.*;
+            const name = std.fs.path.basename(full_path);
+            const target_path = try std.fs.path.join(self.allocator, &.{ trash_path, name });
+            defer self.allocator.free(target_path);
+
+            var final_target = try self.allocator.dupe(u8, target_path);
+            
+            var attempt: usize = 0;
+            while (true) {
+                std.fs.accessAbsolute(final_target, .{}) catch break;
+                self.allocator.free(final_target);
+                attempt += 1;
+                var buf: [64]u8 = undefined;
+                const new_name = try std.fmt.bufPrint(&buf, "{s}_{d}", .{ name, attempt });
+                final_target = try std.fs.path.join(self.allocator, &.{ trash_path, new_name });
+            }
+
+            std.fs.renameAbsolute(full_path, final_target) catch |err| {
+                self.allocator.free(final_target);
+                self.setError(@errorName(err));
+                continue;
+            };
+
+            try history_entry.actions.append(self.allocator, .{
+                .original_path = try self.allocator.dupe(u8, full_path),
+                .trash_path = final_target, // Already duped above
+            });
+        }
+
+        // Push to undo stack
+        if (history_entry.actions.items.len > 0) {
+            try self.undo_stack.append(self.allocator, history_entry);
+            // Clear redo stack on new action
+            var i: usize = 0;
+            while (i < self.redo_stack.items.len) : (i += 1) {
+                self.redo_stack.items[i].deinit(self.allocator);
+            }
+            self.redo_stack.clearRetainingCapacity();
+        } else {
+            history_entry.actions.deinit(self.allocator);
+        }
+
+        // Clear marks
+        var m_iter = self.marked_for_deletion.iterator();
+        while (m_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.marked_for_deletion.clearRetainingCapacity();
+
+        try self.refresh(null);
+    }
+
+    pub fn undo(self: *Browser) !void {
+        if (self.undo_stack.items.len == 0) return;
+        var entry = self.undo_stack.pop().?;
+        
+        var redo_entry = HistoryEntry{ .actions = .{} };
+
+        for (entry.actions.items) |action| {
+            std.fs.renameAbsolute(action.trash_path, action.original_path) catch |err| {
+                self.setError(@errorName(err));
+                continue;
+            };
+            try redo_entry.actions.append(self.allocator, .{
+                .original_path = try self.allocator.dupe(u8, action.original_path),
+                .trash_path = try self.allocator.dupe(u8, action.trash_path),
+            });
+        }
+
+        try self.redo_stack.append(self.allocator, redo_entry);
+        entry.deinit(self.allocator);
+        try self.refresh(null);
+    }
+
+    pub fn redo(self: *Browser) !void {
+        if (self.redo_stack.items.len == 0) return;
+        var entry = self.redo_stack.pop().?;
+        
+        var undo_entry = HistoryEntry{ .actions = .{} };
+
+        for (entry.actions.items) |action| {
+            std.fs.renameAbsolute(action.original_path, action.trash_path) catch |err| {
+                self.setError(@errorName(err));
+                continue;
+            };
+            try undo_entry.actions.append(self.allocator, .{
+                .original_path = try self.allocator.dupe(u8, action.original_path),
+                .trash_path = try self.allocator.dupe(u8, action.trash_path),
+            });
+        }
+
+        try self.undo_stack.append(self.allocator, undo_entry);
+        entry.deinit(self.allocator);
+        try self.refresh(null);
     }
 
     pub fn moveCharForward(self: *Browser) void {

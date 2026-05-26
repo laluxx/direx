@@ -25,10 +25,13 @@ Navigation is keyboard-driven and file opening hands off to `$EDITOR`.
 | `C-y`          | Yank                   |
 | `i`            | Insert mode            |
 | `ESC` `C-g`    | Normal mode            |
+| `c`            | Execute command        |
 | `f`            | Create file            |
 | `+`            | Create directory       |
 | `d`            | Mark for deletion      |
 | `x`            | Execute deletions      |
+| `C-/`          | Undo                   |
+| `C-?`          | Redo                   |
 | `q`            | quit                   |
 
 If you are coming from emacs, I also recommend adding this keybind to your bashrc
